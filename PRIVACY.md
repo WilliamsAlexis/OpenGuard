@@ -25,6 +25,8 @@ OpenGuard es un proyecto de código abierto y gratuito diseñado con el principi
 
 ## 2. Descargas de Actualizaciones
 
+Las descargas ocurren **únicamente cuando el usuario ejecuta `openguard_cli update --online [url]`** (nunca en segundo plano). Solo se aceptan URLs `https://`; por defecto la del repositorio oficial. Si el usuario indica otra URL o una clave `--auth-key`, esa petición va al servidor que él elija.
+
 Cuando OpenGuard consulta actualizaciones de firmas o reglas YARA:
 - La conexión se realiza directamente mediante peticiones HTTPS hacia el repositorio público oficial en GitHub (`https://raw.githubusercontent.com/WilliamsAlexis/OpenGuard`).
 - Solo se descargan listas públicas de firmas y reglas; ninguna información de tu equipo es enviada en dichas peticiones más allá del encabezado estándar de agente de usuario.

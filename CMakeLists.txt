@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.22)
 
 # Nombre del proyecto y metadatos de versión
 project(OpenGuard
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Antivirus gratuito y de código abierto para Windows en C++20"
     LANGUAGES C CXX
 )
@@ -22,9 +22,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(BUILD_TESTING "Compilar la suite de pruebas unitarias" ON)
 option(BUILD_CLI "Compilar la herramienta de consola openguard_cli" ON)
 option(BUILD_SERVICE "Compilar el servicio de Windows openguard_service" ON)
+option(BUILD_GUI "Compilar la interfaz grafica openguard_gui" ON)
+option(OPENGUARD_STATIC_RUNTIME
+       "Enlazar el runtime de C++ de forma estática (/MT) para no requerir el VC++ Redistributable. \
+Exige un triplet estático de vcpkg (x64-windows-static)." ON)
 
 # Configuración específica para el compilador MSVC en Windows
 if(MSVC)
+    if(OPENGUARD_STATIC_RUNTIME)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
     add_compile_options(
         /W4                 # Nivel de advertencias 4 (alto)
         /permissive-        # Cumplimiento estricto del estándar C++
@@ -41,13 +49,18 @@ if(MSVC)
     )
     # Definición de macros seguras de Windows y soporte Unicode completo
     add_compile_definitions(
-        UNICODE
-        _UNICODE
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
         _CRT_SECURE_NO_WARNINGS
     )
 endif()
+
+# Macros de Windows (válidas para cualquier compilador)
+add_compile_definitions(
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    OPENGUARD_VERSION="${PROJECT_VERSION}"
+)
 
 # Directorio global de encabezados públicos
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -57,7 +70,7 @@ find_package(unofficial-sqlite3 CONFIG QUIET)
 if(NOT TARGET unofficial::sqlite3::sqlite3)
     find_package(SQLite3 REQUIRED)
 endif()
-find_package(nlohmann_json CONFIG QUIET)
+find_package(nlohmann_json CONFIG REQUIRED)
 
 # Biblioteca central: openguard_core
 add_subdirectory(src/core)
@@ -70,6 +83,11 @@ endif()
 # Servicio de Windows: openguard_service
 if(BUILD_SERVICE)
     add_subdirectory(src/service)
+endif()
+
+# Interfaz grafica: openguard_gui
+if(BUILD_GUI)
+    add_subdirectory(src/gui)
 endif()
 
 # Suite de pruebas unitarias (Google Test)

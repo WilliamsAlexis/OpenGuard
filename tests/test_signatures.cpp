@@ -90,9 +90,9 @@ TEST_F(SignatureDBTest, SeedEicarInsertsExpectedSignatures) {
     ASSERT_TRUE(matchEicar1.has_value());
     EXPECT_EQ(matchEicar1->malwareName, "EICAR-Standard-AV-Test-File");
 
-    auto matchEicar2 = m_db->lookup("13db60afb914a2ee9b3649d1947d58046d1a9e9b8e4114d80b1d5c142b4ed7fa");
+    auto matchEicar2 = m_db->lookup("131f95c51cc819465fa1797f6ccacf9d494aaaff46fa3eac73ae63ffbdfd8267");
     ASSERT_TRUE(matchEicar2.has_value());
-    EXPECT_EQ(matchEicar2->malwareName, "EICAR-Standard-AV-Test-File-Raw");
+    EXPECT_EQ(matchEicar2->malwareName, "EICAR-Standard-AV-Test-File-LF");
 }
 
 // Probar importación masiva de firmas en transacción

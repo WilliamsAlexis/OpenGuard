@@ -27,6 +27,7 @@ struct PESectionInfo {
     uint32_t virtualAddress{0};     ///< Dirección virtual relativa (RVA).
     uint32_t virtualSize{0};        ///< Tamaño de la sección en memoria.
     uint32_t rawDataSize{0};        ///< Tamaño de los datos en disco.
+    uint32_t rawDataPointer{0};     ///< Offset físico de los datos en el archivo (PointerToRawData).
     uint32_t characteristics{0};    ///< Flags de características (IMAGE_SCN_MEM_EXECUTE, etc.).
     double entropy{0.0};            ///< Entropía de Shannon calculada (0.0 a 8.0).
     bool isExecutable{false};       ///< Indica si la sección tiene permisos de ejecución.

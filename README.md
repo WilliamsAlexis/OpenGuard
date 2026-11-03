@@ -15,162 +15,179 @@
 
 ### ¿Qué es OpenGuard?
 
-**OpenGuard** es un antivirus gratuito, de código abierto y de alta eficiencia desarrollado en **C++20** nativo para Windows 10 y 11. Diseñado bajo principios de **ciberseguridad defensiva** y **privacidad por diseño**, OpenGuard realiza todo el análisis criptográfico, heurístico y de comportamiento de forma **100% local**, sin telemetría ni exfiltración de datos hacia servidores externos.
+**OpenGuard** es un antivirus gratuito y de código abierto desarrollado en **C++20** nativo para Windows 10 y 11. Diseñado bajo principios de **ciberseguridad defensiva** y **privacidad por diseño**, realiza todo el análisis criptográfico, heurístico y de comportamiento de forma **100% local**, sin telemetría ni exfiltración de datos.
+
+> **Estado del proyecto (v0.2):** motor funcional en modo usuario (CLI + servicio de protección en tiempo real). La base de firmas incluida contiene únicamente las firmas del archivo de prueba EICAR: para detectar malware real debe cargar sus propias firmas con `openguard_cli update <archivo.json>`. No sustituye a una solución antivirus comercial; ver [ROADMAP.md](ROADMAP.md) para las limitaciones del modo usuario.
 
 ---
 
-### ✨ Características y Métodos Defensivos Implementados
+### ✨ Características
 
-| Módulo | Tecnología Subyacente | Capacidad Defensiva |
+| Módulo | Tecnología | Capacidad defensiva |
 |---|---|---|
-| **Cotejo de Firmas** | SQLite3 B-Tree + BCrypt | Búsqueda indexada instantánea por SHA-256, SHA-1 y MD5 con lectura en bloques de 64 KB. |
-| **Análisis Estático PE** | Estructuras nativas `winnt.h` | Parseo profundo de binarios x86/x64, verificación de puntos de entrada y anomalías de timestamp. |
-| **Entropía de Shannon** | Cálculo matemático de entropía | Detección de secciones con entropía $> 7.1$ (indicio crítico de compresión o empaquetado malicioso). |
-| **Inspección de Imports (IAT)** | Tabla de Importaciones PE | Detección de combinaciones de APIs de inyección (`VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`). |
-| **Permisos W+X** | Flags de sección PE | Detección de secciones con permisos simultáneos de Escritura y Ejecución (técnica común de unpackers). |
-| **Firmas Authenticode** | WinVerifyTrust API | Comprobación de validez criptográfica de firmas digitales y extracción de entidades emisoras. |
-| **Heurística de Scripts** | Motor sintáctico multilinguaje | Detección de evasión de AMSI, cunas de descarga (`Net.WebClient`), ejecución en memoria (IEX) y Base64. |
-| **Bóveda de Cuarentena** | AES-256 CBC con Windows CNG | Aislamiento cifrado `.qbin` con destrucción segura del archivo original mediante sobrescritura aleatoria. |
-| **Auditoría de Vulnerabilidades** | Win32 Registry + NetAPI | Detección de SMBv1 activo (EternalBlue), UAC desactivado, Firewall o Defender deshabilitados y cuenta Guest. |
-| **Auditoría de Red** | IP Helper API (iphlpapi) | Enumeración de conexiones TCP/UDP con PID propietario, detección de puertos C2 (4444, 1337) y secuestro de `hosts`. |
-| **Servicio de Windows** | Service Control Manager (SCM) | Ejecución en segundo plano (`openguard_service.exe`) con soporte de instalación y remoción desatendida. |
+| **Cotejo de firmas** | SQLite3 + BCrypt (CNG) | Búsqueda indexada por SHA-256, SHA-1 y MD5 calculados en una sola pasada. Importación masiva desde JSON (`hashes_index.json`). |
+| **Análisis estático PE** | Parseo nativo de `winnt.h` | Encabezados PE32/PE32+, **tabla de importaciones (IAT) real**, entropía de Shannon por sección, secciones W+X, punto de entrada anómalo, packers conocidos y overlay. |
+| **Combinaciones de APIs** | IAT | Puntúa patrones característicos (inyección remota, process hollowing, keylogger, downloader), no APIs aisladas, para limitar falsos positivos. |
+| **Firmas Authenticode** | WinVerifyTrust + catálogos | Valida firmas embebidas **y firmas por catálogo** (binarios de Windows) y extrae el firmante. |
+| **Heurística de scripts** | Análisis sintáctico | PowerShell, VBScript/JScript, Batch y HTA: evasión de AMSI, cunas de descarga, IEX, Base64, `vssadmin delete shadows`. |
+| **Bóveda de cuarentena** | AES-256-CBC (CNG) + DPAPI | Cifrado `.qbin`, clave protegida con DPAPI, verificación de integridad SHA-256 al restaurar y borrado seguro del original. |
+| **Protección en tiempo real** | `ReadDirectoryChangesW` | Servicio de Windows que vigila Descargas, Escritorio, Documentos y Temp, analiza cada archivo nuevo/modificado y escanea USB al conectarse. |
+| **Anti-ransomware** | Archivos señuelo + ráfagas | El servicio crea archivos señuelo ocultos en Documentos y Escritorio y alerta si se modifican, eliminan o renombran; también alerta ante >=150 archivos modificados en 10 s. Solo alerta (en modo usuario no puede identificar ni detener el proceso). |
+| **Reglas YARA** | Intérprete `yara_lite` | Evalúa `signatures/yara_rules/*.yar` (primeros 4 MB de cada archivo) y reporta detecciones `YARA.<regla>`. |
+| **Interfaz gráfica** | Win32 nativo | `openguard_gui.exe`: análisis rápido/completo/carpeta, lista de amenazas, aislar, gestor de cuarentena, estado del servicio, registro y **avisos en la bandeja del sistema** cuando el servicio detecta algo. |
+| **Auditoría de vulnerabilidades** | Registro + NetAPI | SMBv1, UAC, Firewall, Defender deshabilitado por política, RDP y cuenta Guest. |
+| **Auditoría de red** | IP Helper API | Conexiones TCP con PID/proceso, puertos C2 conocidos, secuestro del archivo `hosts` y proxy local. |
+
+**Limitaciones conocidas**
+
+- El motor YARA es un intérprete propio de un **subconjunto** de YARA (strings de texto/hex/regex, `N of`, `and/or/not`, `filesize`). Las reglas con módulos (`pe`, `uint16`, etc.) se descartan al cargar.
+- Opera en modo usuario (post-operación): no puede bloquear la ejecución previa como un minifilter de kernel.
+- La base de firmas incluida solo trae EICAR: use `update --online <url>` con una lista de hashes de su confianza (p. ej. un feed de abuse.ch MalwareBazaar con su `--auth-key`).
+- El servicio registra detecciones y alertas en `%ProgramData%OpenGuardogsservice.log`; no muestra notificaciones emergentes (use la GUI o `openguard_cli logs`).
+- El servicio solo aísla automáticamente lo **confirmado** (coincidencia de firma o riesgo crítico). Las sospechas heurísticas se registran sin tocar el archivo.
 
 ---
 
-### 🏛️ Arquitectura Modular del Proyecto
+### 📥 Instalación (usuarios)
+
+Descargue `OpenGuard_Setup_v<versión>.exe` desde la sección *Releases* (o desde el artefacto `OpenGuard-Installer` de la ejecución de GitHub Actions) y ejecútelo como Administrador. El instalador:
+
+1. Copia `openguard_cli.exe`, `openguard_service.exe` y las firmas a `C:\Program Files\OpenGuard`.
+2. Inicializa la base de firmas en `%ProgramData%\OpenGuard`.
+3. Registra e inicia el servicio **OpenGuardService** (inicio automático, reinicio ante fallos).
+4. Crea accesos directos y, opcionalmente, agrega OpenGuard al `PATH`.
+
+> El instalador no está firmado digitalmente, por lo que SmartScreen puede mostrar una advertencia. Verifique el hash SHA-256 publicado junto al instalador.
+
+---
+
+### 💻 Uso del CLI
+
+```text
+openguard_cli scan <ruta>            Analiza un archivo o carpeta
+openguard_cli quick                  Descargas, Escritorio, Documentos, Temp e Inicio
+openguard_cli full                   Todas las unidades fijas
+openguard_cli pe <ejecutable>        Informe estático PE (IAT, entropía, firma digital)
+openguard_cli scan|quick|full ... --quarantine    Aísla amenazas de riesgo alto/crítico
+openguard_cli quarantine list | restore <id> | delete <id>
+openguard_cli vuln                   Auditoría de configuración de Windows
+openguard_cli network                Auditoría de conexiones y archivo hosts
+openguard_cli stats | update [json]  Estado e importación de firmas
+openguard_cli update --online [url] [--auth-key K] [--name N]
+                                     Descarga firmas por HTTPS (JSON de OpenGuard o lista de hashes)
+openguard_cli status | logs [n]      Estado y registro del servicio de tiempo real
+```
+
+Códigos de salida: `0` sin amenazas · `1` error · `2` amenazas detectadas.
+
+Gestionar la cuarentena y actualizar firmas requiere ejecutar la consola como **Administrador** (los datos en `%ProgramData%\OpenGuard` son de solo lectura para usuarios estándar, para que un proceso sin privilegios no pueda alterar las firmas ni la bóveda).
+
+Servicio manual: `openguard_service.exe --install | --uninstall | --console` (este último ejecuta el motor en primer plano para depurar).
+
+---
+
+### 🏛️ Arquitectura
 
 ```
 OpenGuard/
 ├── include/openguard/          # Encabezados públicos C++20
-│   ├── types.h                 # Modelos ScanResult, RiskLevel, ThreatInfo
-│   ├── crypto_utils.h          # Criptografía nativa Windows CNG (BCrypt)
-│   ├── signatures.h            # Gestor SQLite3 de firmas
-│   ├── pe_analyzer.h           # Analizador estático PE y Authenticode
-│   ├── quarantine.h            # Bóveda cifrada AES-256
-│   ├── heuristics.h            # Motor de scripts (PowerShell, VBS, Batch)
-│   ├── vuln_scan.h             # Auditor de configuraciones de Windows
-│   ├── network_scan.h          # Auditor de sockets TCP/UDP y puertos C2
-│   └── thread_pool.h           # Pool de subprocesos concurrente
 ├── src/
-│   ├── core/                   # Biblioteca estática openguard_core
-│   ├── cli/                    # Herramienta de línea de comandos openguard_cli
-│   └── service/                # Servicio del sistema openguard_service
-├── tests/                      # Suite de pruebas unitarias (Google Test)
-├── signatures/                 # Firmas JSON, manifest.sha256 y reglas YARA
-├── installer.iss               # Script de empaquetado para Inno Setup
-└── ROADMAP.md                  # Plan de evolución hacia Minifilter Driver (Kernel Ring 0)
+│   ├── core/                   # openguard_core: firmas, escáner, PE, scripts, cuarentena, monitor, red, vulnerabilidades
+│   ├── cli/                    # openguard_cli
+│   └── service/                # openguard_service (Servicio de Windows)
+├── tests/                      # Google Test
+├── signatures/                 # hashes_index.json, manifest.sha256 y reglas YARA (evaluadas por yara_lite)
+├── scripts/build_installer.ps1 # Compila, prueba y genera el instalador
+├── installer.iss               # Script de Inno Setup
+└── ROADMAP.md                  # Evolución hacia minifilter (Ring 0), AMSI, ETW
 ```
+
+Datos en tiempo de ejecución (`%ProgramData%\OpenGuard`, redirigible con la variable `OPENGUARD_DATA_DIR`): `hashes.db`, `quarantine\`, `logs\service.log`.
 
 ---
 
-### 🛠️ Compilación con Visual Studio 2022 y CMake
+### 🛠️ Compilación (desarrolladores)
 
-#### 1. Requisitos Previos
-- Windows 10 o 11 (64 bits).
-- Visual Studio 2022 (con la carga de trabajo *"Desarrollo para el escritorio con C++"*).
-- CMake 3.22 o superior.
-- vcpkg instalado en `C:\vcpkg`.
+**Requisitos:** Windows 10/11 x64 · Visual Studio 2022 (carga *Desarrollo para el escritorio con C++*) · CMake ≥ 3.22 · [vcpkg](https://github.com/microsoft/vcpkg) · (para el instalador) [Inno Setup 6](https://jrsoftware.org/isdl.php).
 
-#### 2. Instalación de Dependencias con vcpkg
 ```powershell
 git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-cd C:\vcpkg
-.\bootstrap-vcpkg.bat
-.\vcpkg integrate install
-```
+C:\vcpkg\bootstrap-vcpkg.bat
 
-#### 3. Configuración y Compilación
-```powershell
 cd d:\APLICACIONES\OpenGuard
-
-# Generar la solución de Visual Studio 2022 para x64
-cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
-
-# Compilar en modo Release optimizado
+# Triplet ESTÁTICO: el runtime de C++ y SQLite van dentro de los .exe (sin VC++ Redistributable)
+cmake -B build -S . -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static
 cmake --build build --config Release --parallel
-```
-
-Los binarios generados se encontrarán en:
-- `build\src\cli\Release\openguard_cli.exe`
-- `build\src\service\Release\openguard_service.exe`
-- `build\tests\Release\openguard_tests.exe`
-
-#### 4. Ejecución de Pruebas Unitarias
-```powershell
 ctest --test-dir build -C Release --output-on-failure
 ```
 
----
+Si prefiere el triplet dinámico (`x64-windows`), configure además `-DOPENGUARD_STATIC_RUNTIME=OFF`.
 
-### 🧪 Prueba Defensiva con el Archivo Estándar EICAR
-
-> **AVISO IMPORTANTE**: Nunca ejecutes ni descargues malware real. Realiza siempre tus pruebas de validación en máquinas virtuales (Hyper-V, VirtualBox o VMware) utilizando el archivo de prueba estándar EICAR.
-
-1. Genera el archivo inofensivo EICAR en PowerShell:
-   ```powershell
-   Set-Content -Path "test_eicar.txt" -Value 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' -NoNewline
-   ```
-
-2. Ejecuta OpenGuard CLI:
-   ```powershell
-   .\build\src\cli\Release\openguard_cli.exe scan test_eicar.txt
-   ```
-
-3. **Resultado**: OpenGuard identificará la firma `EICAR-Standard-AV-Test-File-Raw`, informará los hashes criptográficos calculados mediante BCrypt y reportará la alerta de severidad correspondiente.
+Binarios: `build\src\cli\Release\openguard_cli.exe`, `build\src\service\Release\openguard_service.exe`, `build\tests\Release\openguard_tests.exe`.
 
 ---
 
-### 📦 Empaquetado del Instalador con Inno Setup
+### 📦 Generar el instalador
 
-Para generar un instalador ejecutable único para distribución:
-1. Descarga e instala [Inno Setup](https://jrsoftware.org/isdl.php).
-2. Compila el script de empaquetado:
-   ```powershell
-   & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-   ```
-3. El instalador generado estará disponible en `dist\OpenGuard_Setup_v0.1.0.exe`.
-
----
-
-### 🚀 Publicación en GitHub (https://github.com/WilliamsAlexis/OpenGuard)
+Un solo comando compila, ejecuta las pruebas, prepara `dist\stage` y llama a Inno Setup:
 
 ```powershell
-cd d:\APLICACIONES\OpenGuard
-
-# 1. Configurar rama principal
-git branch -M main
-
-# 2. Configurar el origen remoto
-git remote add origin https://github.com/WilliamsAlexis/OpenGuard.git
-
-# 3. Preparar archivos
-git add .
-
-# 4. Crear commit de versión C++20
-git commit -m "feat(cpp): complete native C++20 defensive antivirus engine with Win32 CNG, PE analyzer and AES-256 vault"
-
-# 5. Subir a GitHub
-git push -u origin main
-
-# 6. Crear y subir Tag de versión
-git tag -a v0.1.0 -m "OpenGuard v0.1.0 - Native C++20 Release"
-git push origin v0.1.0
+powershell -ExecutionPolicy Bypass -File scripts\build_installer.ps1
 ```
+
+Resultado: `dist\OpenGuard_Setup_v<versión>.exe` y su `.sha256`. La versión se toma de `CMakeLists.txt`.
+Opciones: `-VcpkgRoot <ruta>`, `-SkipTests`, `-SkipBuild` (reutiliza `build\`).
+
+En GitHub Actions el instalador se genera automáticamente y se publica como artefacto; al subir un tag `v*` se adjunta a la *Release*:
+
+```powershell
+git tag -a v0.2.0 -m "OpenGuard v0.2.0"
+git push origin v0.2.0
+```
+
+---
+
+### 🧪 Prueba defensiva con el archivo EICAR
+
+> **AVISO**: nunca ejecute ni descargue malware real fuera de una máquina virtual aislada. EICAR es un archivo de prueba inofensivo estándar.
+
+```powershell
+Set-Content -Path "test_eicar.txt" -Value 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' -NoNewline
+openguard_cli scan test_eicar.txt          # Detecta: EICAR-Standard-AV-Test-File
+openguard_cli scan test_eicar.txt --quarantine
+openguard_cli quarantine list
+```
+
+(Si Windows Defender está activo, puede aislar el archivo EICAR antes de que OpenGuard lo analice: use una carpeta excluida o una VM.)
 
 ---
 
 <a name="english"></a>
 ## English
 
-**OpenGuard** is a free and open-source defensive antivirus and security scanner for Windows 10/11 written in modern **C++20** using native Win32 APIs, Windows Cryptography Next Generation (CNG / BCrypt), and SQLite3.
+**OpenGuard** is a free, open-source defensive antivirus and security scanner for Windows 10/11 written in modern **C++20** with native Win32 APIs, Windows CNG (BCrypt), DPAPI and SQLite3.
 
-### Core Capabilities
-- **C++20 Multithreaded Engine**: High-throughput file scanning via native thread pool with 64 KB chunked reads.
-- **PE Static Analyzer**: Section Shannon entropy calculation ($H > 7.1$), W+X permission detection, suspicious IAT imports (`VirtualAllocEx`, `CreateRemoteThread`), and Authenticode verification via `WinVerifyTrust`.
-- **Script Heuristics**: Detection of AMSI bypasses, Base64 obfuscated PowerShell, in-memory execution cradles, and ransomware volume shadow copy deletion (`vssadmin`).
-- **AES-256 Quarantine Vault**: Hardware-accelerated symmetric encryption with cryptographic DoD secure wipe before original deletion.
-- **System Hardening Audit**: Audits SMBv1 (EternalBlue vector), UAC status, Windows Firewall profiles, and RDP exposure.
-- **Network Sockets Audit**: Extended TCP table inspection with owning PID resolution and C2 port alerting.
+> **Status (v0.2):** working user-mode engine (CLI + real-time protection service). The bundled signature database only contains the EICAR test file; load your own signatures with `openguard_cli update <file.json>`. YARA rules are evaluated by a built-in YARA subset interpreter; a native GUI (`openguard_gui.exe`) and ransomware decoy files are included.
+
+### Capabilities
+- **Multithreaded scanner** with batched processing (safe for full-disk scans) and SHA-256/SHA-1/MD5 signature lookup.
+- **PE static analyzer** with a real import-table (IAT) parser, per-section entropy, W+X sections, packer detection, and Authenticode verification including **catalog-signed** Windows binaries. API *combinations* (remote injection, process hollowing, keylogger, downloader) are scored instead of isolated APIs, to limit false positives.
+- **Script heuristics** for PowerShell, VBScript/JScript, Batch, HTA (AMSI bypass, download cradles, IEX, Base64, shadow-copy deletion).
+- **Encrypted quarantine vault** (AES-256-CBC, DPAPI-protected key, SHA-256 integrity check on restore, secure wipe).
+- **Real-time protection service** (`ReadDirectoryChangesW`) watching Downloads/Desktop/Documents/Temp, scanning USB drives on arrival, and auto-quarantining confirmed detections only.
+- **System hardening audit** (SMBv1, UAC, Firewall, RDP, Guest) and **network audit** (C2 ports, hosts hijack, local proxy).
+
+### Build & installer
+```powershell
+cmake -B build -S . -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
+
+# Build + test + installer (requires Inno Setup 6)
+powershell -ExecutionPolicy Bypass -File scripts\build_installer.ps1
+```
 
 Refer to [`ROADMAP.md`](ROADMAP.md) for technical documentation on user-mode limitations and kernel minifilter driver planning.
-

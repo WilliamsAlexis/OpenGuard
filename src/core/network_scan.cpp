@@ -6,6 +6,7 @@
  */
 
 #include "openguard/network_scan.h"
+#include "openguard/paths.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -85,7 +86,7 @@ std::string NetworkScanner::getProcessNameFromPid(uint32_t pid) {
 
     if (QueryFullProcessImageNameW(hProcess, 0, exePath, &pathLen) && pathLen > 0) {
         std::filesystem::path p(exePath);
-        procName = p.filename().string();
+        procName = paths::toUtf8(p.filename());
     }
     CloseHandle(hProcess);
 
@@ -240,7 +241,7 @@ void NetworkScanner::checkProxySettings(NetworkScanReport& report) {
                     f.description = "Proxy local configurado en Windows (posible malware realizando MITM local)";
                     f.severity = "high";
                     f.score = 60;
-                    f.detail = std::string(wProxy.begin(), wProxy.end());
+                    int len = WideCharToMultiByte(CP_UTF8, 0, wProxy.c_str(), -1, nullptr, 0, nullptr, nullptr); if (len > 1) { f.detail.resize(len - 1); WideCharToMultiByte(CP_UTF8, 0, wProxy.c_str(), -1, f.detail.data(), len, nullptr, nullptr); }
                     report.addFinding(f);
                 }
             }

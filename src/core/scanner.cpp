@@ -7,10 +7,16 @@
 
 #include "openguard/scanner.h"
 #include "openguard/crypto_utils.h"
+#include "openguard/paths.h"
 
+#include <windows.h>
+
+#include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <future>
+#include <mutex>
 #include <unordered_set>
-#include <iostream>
 
 namespace openguard {
 
@@ -34,6 +40,10 @@ FileScanner::FileScanner(std::shared_ptr<SignatureDB> sigDb, ScannerConfig confi
     : m_sigDb(std::move(sigDb)), m_config(config) {
     m_threadPool = std::make_unique<ThreadPool>(m_config.threadCount);
     m_heuristics = std::make_unique<HeuristicsEngine>();
+    if (!m_config.yaraRulesDir.empty()) {
+        m_yara = std::make_unique<YaraLite>();
+        m_yara->loadDirectory(m_config.yaraRulesDir);
+    }
 }
 
 ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
@@ -92,6 +102,10 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
             else if (match->severity == "medium") score = 50;
             else if (match->severity == "low") score = 25;
 
+            // Una coincidencia exacta de hash es siempre una detección confirmada: nunca debe
+            // quedar por debajo del umbral de amenaza aunque la severidad registrada sea baja.
+            score = std::max(score, 61);
+
             result.addThreat(
                 match->malwareName,
                 "hash_signature",
@@ -111,6 +125,23 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
             40,
             "El archivo utiliza una extensión doble potencialmente engañosa"
         );
+    }
+
+    // 4b. Reglas YARA (primeros 4 MB del contenido)
+    if (m_yara && m_yara->ruleCount() > 0 && fileSize > 0) {
+        std::ifstream in(filePath, std::ios::binary);
+        if (in.is_open()) {
+            std::vector<uint8_t> head(std::min<size_t>(static_cast<size_t>(fileSize), 4 * 1024 * 1024));
+            in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+            head.resize(static_cast<size_t>(in.gcount()));
+            for (const auto& m : m_yara->scan(head.data(), head.size())) {
+                int yScore = 45;
+                if (m.severity == "critical") yScore = 85;
+                else if (m.severity == "high") yScore = 70;
+                else if (m.severity == "low") yScore = 20;
+                result.addThreat("YARA." + m.rule, "yara", m.severity, yScore, m.description);
+            }
+        }
     }
 
     // 5. Análisis heurístico profundo de PE y scripts
@@ -136,13 +167,13 @@ bool FileScanner::hasDoubleExtension(const std::filesystem::path& path) {
         ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".jpg", ".png", ".zip"
     };
 
-    std::string ext = toLowerStr(path.extension().string());
+    std::string ext = paths::extensionLower(path);
     if (dangerousExts.find(ext) == dangerousExts.end()) {
         return false;
     }
 
     std::filesystem::path stemPath = path.stem();
-    std::string innerExt = toLowerStr(stemPath.extension().string());
+    std::string innerExt = paths::extensionLower(stemPath);
 
     return decoyExts.find(innerExt) != decoyExts.end();
 }
@@ -160,61 +191,45 @@ ScanSessionStats FileScanner::scanPaths(
     ScanType type,
     std::function<void(const ScanResult&)> progressCallback
 ) {
+    namespace fs = std::filesystem;
+
     m_cancelRequested = false;
     ScanSessionStats session;
     session.scanType = type;
 
     auto startClock = std::chrono::high_resolution_clock::now();
 
-    // 1. Recolección de archivos a escanear (recursiva y con tolerancia a rutas protegidas)
-    std::vector<std::filesystem::path> filesToScan;
-
-    for (const auto& basePath : targetPaths) {
-        if (m_cancelRequested) break;
-
-        std::error_code ec;
-        if (!std::filesystem::exists(basePath, ec)) continue;
-
-        if (std::filesystem::is_regular_file(basePath, ec)) {
-            filesToScan.push_back(basePath);
-        } else if (std::filesystem::is_directory(basePath, ec)) {
-            auto itOptions = std::filesystem::directory_options::skip_permission_denied;
-            for (auto it = std::filesystem::recursive_directory_iterator(basePath, itOptions, ec);
-                 it != std::filesystem::recursive_directory_iterator();
-                 it.increment(ec)) {
-                if (ec) {
-                    ec.clear();
-                    continue;
-                }
-                if (m_cancelRequested) break;
-
-                if (it->is_regular_file(ec) && !it->is_symlink(ec)) {
-                    filesToScan.push_back(it->path());
-                }
-            }
+    // Comprueba si una ruta cae dentro de algún directorio excluido de la configuración
+    auto isExcluded = [this](const fs::path& p) {
+        for (const auto& ex : m_config.excludedPaths) {
+            const fs::path rel = p.lexically_relative(ex);
+            if (!rel.empty() && *rel.begin() != "..") return true;
         }
-    }
+        return false;
+    };
 
-    // 2. Procesamiento multihilo paralelo
-    std::mutex resultsMutex;
-    std::vector<std::future<ScanResult>> futures;
-    futures.reserve(filesToScan.size());
+    // Los archivos se procesan por lotes: así un escaneo completo (millones de archivos)
+    // no acumula todas las tareas y resultados en memoria.
+    constexpr size_t kBatchSize = 512;
+    std::vector<fs::path> batch;
+    batch.reserve(kBatchSize);
 
-    for (const auto& fPath : filesToScan) {
-        if (m_cancelRequested) break;
+    auto flushBatch = [&]() {
+        std::vector<std::future<ScanResult>> futures;
+        futures.reserve(batch.size());
 
-        futures.push_back(m_threadPool->enqueue([this, fPath]() {
-            return this->scanFile(fPath);
-        }));
-    }
+        for (const auto& fPath : batch) {
+            futures.push_back(m_threadPool->enqueue([this, fPath]() {
+                return this->scanFile(fPath);
+            }));
+        }
+        batch.clear();
 
-    for (auto& fut : futures) {
-        if (m_cancelRequested) break;
-
-        try {
-            ScanResult res = fut.get();
-            {
-                std::lock_guard<std::mutex> lock(resultsMutex);
+        // Siempre se esperan todas las tareas del lote, incluso si se canceló, para no dejar
+        // trabajos en vuelo que referencien objetos que podrían destruirse tras retornar.
+        for (auto& fut : futures) {
+            try {
+                ScanResult res = fut.get();
                 if (res.skipped) {
                     session.filesSkipped++;
                 } else {
@@ -223,17 +238,55 @@ ScanSessionStats FileScanner::scanPaths(
                         session.threatsFound++;
                     }
                 }
-                session.results.push_back(res);
+
+                if (progressCallback) {
+                    progressCallback(res);
+                }
+
+                if (m_config.keepCleanResults || res.riskScore > 0) {
+                    session.results.push_back(std::move(res));
+                }
+            } catch (...) {
+                session.filesSkipped++;
+            }
+        }
+    };
+
+    for (const auto& basePath : targetPaths) {
+        if (m_cancelRequested) break;
+
+        std::error_code ec;
+        const auto st = fs::status(basePath, ec);
+        if (ec || !fs::exists(st)) continue;
+
+        if (fs::is_regular_file(st)) {
+            batch.push_back(basePath);
+            if (batch.size() >= kBatchSize) flushBatch();
+            continue;
+        }
+        if (!fs::is_directory(st)) continue;
+
+        fs::recursive_directory_iterator it(basePath, fs::directory_options::skip_permission_denied, ec);
+        const fs::recursive_directory_iterator endIt;
+
+        while (!ec && it != endIt) {
+            if (m_cancelRequested) break;
+
+            std::error_code entryEc;
+            const bool isLink = it->is_symlink(entryEc);
+
+            if (!isLink && it->is_directory(entryEc)) {
+                if (isExcluded(it->path())) it.disable_recursion_pending();
+            } else if (!isLink && it->is_regular_file(entryEc)) {
+                batch.push_back(it->path());
+                if (batch.size() >= kBatchSize) flushBatch();
             }
 
-            if (progressCallback) {
-                progressCallback(res);
-            }
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(resultsMutex);
-            session.filesSkipped++;
+            it.increment(ec);
         }
     }
+
+    if (!batch.empty()) flushBatch();
 
     auto endClock = std::chrono::high_resolution_clock::now();
     session.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endClock - startClock);
@@ -241,5 +294,17 @@ ScanSessionStats FileScanner::scanPaths(
     return session;
 }
 
-} // namespace openguard
+std::vector<std::filesystem::path> FileScanner::getFixedDrives() {
+    std::vector<std::filesystem::path> drives;
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if ((mask & (1u << i)) == 0) continue;
+        const wchar_t root[] = { static_cast<wchar_t>(L'A' + i), L':', L'\', L'\0' };
+        if (GetDriveTypeW(root) == DRIVE_FIXED) {
+            drives.emplace_back(root);
+        }
+    }
+    return drives;
+}
 
+} // namespace openguard

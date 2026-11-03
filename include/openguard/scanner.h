@@ -12,6 +12,7 @@
 #include "openguard/signatures.h"
 #include "openguard/thread_pool.h"
 #include "openguard/heuristics.h"
+#include "openguard/yara_lite.h"
 
 #include <filesystem>
 #include <vector>
@@ -30,6 +31,9 @@ struct ScannerConfig {
     size_t bufferSizeBytes{65536};              ///< Tamaño del bloque de lectura en bytes (64 KB).
     size_t threadCount{0};                      ///< Hilos concurrentes (0 = automático).
     bool checkDoubleExtensions{true};           ///< Activar heurística de doble extensión sospechosa.
+    bool keepCleanResults{false};               ///< Conservar en la sesión también los archivos limpios (consume memoria en escaneos grandes).
+    std::vector<std::filesystem::path> excludedPaths; ///< Directorios que se omiten en escaneos recursivos (ej: la cuarentena).
+    std::filesystem::path yaraRulesDir;         ///< Carpeta con reglas *.yar (vacía = motor YARA desactivado).
 };
 
 /**
@@ -85,6 +89,12 @@ public:
     );
 
     /**
+     * @brief Enumera las unidades de disco fijas (HDD/SSD) del equipo, ej: "C:\\".
+     * @return Raíces de las unidades fijas.
+     */
+    [[nodiscard]] static std::vector<std::filesystem::path> getFixedDrives();
+
+    /**
      * @brief Detiene anticipadamente un escaneo en curso de forma segura.
      */
     void cancelScan() noexcept { m_cancelRequested = true; }
@@ -94,6 +104,9 @@ public:
      * @return true si se canceló; false si continúa la ejecución.
      */
     [[nodiscard]] bool isCancelled() const noexcept { return m_cancelRequested; }
+
+    /// Cantidad de reglas YARA cargadas (0 si el motor está desactivado).
+    [[nodiscard]] size_t yaraRuleCount() const noexcept { return m_yara ? m_yara->ruleCount() : 0; }
 
 private:
     /**
@@ -107,6 +120,7 @@ private:
     ScannerConfig m_config;
     std::unique_ptr<ThreadPool> m_threadPool;
     std::unique_ptr<HeuristicsEngine> m_heuristics;
+    std::unique_ptr<YaraLite> m_yara;
     std::atomic<bool> m_cancelRequested{false};
 };
 

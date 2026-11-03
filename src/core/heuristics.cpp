@@ -6,10 +6,11 @@
  */
 
 #include "openguard/heuristics.h"
+#include "openguard/paths.h"
 
 #include <fstream>
 #include <algorithm>
-#include <regex>
+#include <iterator>
 
 namespace openguard {
 
@@ -33,7 +34,7 @@ ScriptReport ScriptAnalyzer::analyze(const std::filesystem::path& filePath) {
     ScriptReport report;
     report.filePath = filePath;
 
-    std::string ext = toLowerString(filePath.extension().string());
+    std::string ext = paths::extensionLower(filePath);
 
     if (ext == ".ps1" || ext == ".psm1" || ext == ".psd1") {
         report.scriptType = "PowerShell";
@@ -52,9 +53,11 @@ ScriptReport ScriptAnalyzer::analyze(const std::filesystem::path& filePath) {
     std::ifstream file(filePath, std::ios::binary);
     if (!file.is_open()) return report;
 
-    // Lectura de hasta 512 KB para análisis estático de scripts
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+    // Lectura de hasta 512 KB para análisis estático de scripts (evita cargar archivos enormes en RAM)
+    constexpr size_t kMaxScriptBytes = 512 * 1024;
+    std::string content(kMaxScriptBytes, '\0');
+    file.read(content.data(), static_cast<std::streamsize>(kMaxScriptBytes));
+    content.resize(static_cast<size_t>(file.gcount()));
     file.close();
 
     if (content.empty()) return report;
@@ -141,7 +144,7 @@ void ScriptAnalyzer::analyzePowerShell(const std::string& content, ScriptReport&
 
 void ScriptAnalyzer::analyzeVbsJs(const std::string& content, ScriptReport& report) {
     if (content.find("wscript.shell") != std::string::npos &&
-        (content.find("run") != std::string::npos || content.find("exec") != std::string::npos)) {
+        (content.find(".run") != std::string::npos || content.find(".exec") != std::string::npos)) {
         report.addFinding("Llamada de ejecucion de comandos del sistema operativo (WScript.Shell.Run)", 30);
     }
 
@@ -179,7 +182,7 @@ ScanResult HeuristicsEngine::evaluate(const std::filesystem::path& filePath) {
     ScanResult result;
     result.filePath = filePath;
 
-    std::string ext = toLowerString(filePath.extension().string());
+    std::string ext = paths::extensionLower(filePath);
 
     // 1. Evaluación de ejecutables y librerías PE
     if (ext == ".exe" || ext == ".dll" || ext == ".sys" || ext == ".scr" || ext == ".ocx") {

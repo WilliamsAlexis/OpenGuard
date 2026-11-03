@@ -16,6 +16,7 @@
 #include <future>
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
 
 namespace openguard {

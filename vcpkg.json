@@ -1,6 +1,6 @@
 {
   "name": "openguard",
-  "version-string": "0.1.0",
+  "version-string": "0.2.0",
   "description": "Antivirus defensivo y de código abierto para Windows 10/11 en C++20",
   "homepage": "https://github.com/WilliamsAlexis/OpenGuard",
   "license": "MIT",

@@ -8,17 +8,25 @@
 
 #include "openguard/quarantine.h"
 #include "openguard/crypto_utils.h"
+#include "openguard/paths.h"
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
+#include <dpapi.h>
 #include <sqlite3.h>
 
+#include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <chrono>
+#include <iterator>
+#include <optional>
 #include <sstream>
 #include <iomanip>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((LONG)(Status)) >= 0)
@@ -37,7 +45,7 @@ constexpr char VAULT_MAGIC[4] = {'O', 'G', 'Q', 'B'}; // OpenGuard Quarantine Bi
  */
 std::string generateQID(const std::filesystem::path& path) {
     auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    std::string seed = path.string() + std::to_string(now);
+    std::string seed = paths::toUtf8(path) + std::to_string(now); // UTF-8: path.string() puede fallar con caracteres no ANSI
     return CryptoUtils::computeSha256FromBuffer(seed.data(), seed.size()).substr(0, 16);
 }
 
@@ -54,6 +62,14 @@ std::string getCurrentIsoTime() {
     std::ostringstream oss;
     oss << std::put_time(&gm, "%Y-%m-%dT%H:%M:%SZ");
     return oss.str();
+}
+
+/**
+ * @brief Lee una columna de texto de SQLite devolviendo cadena vacía si es NULL.
+ */
+std::string columnText(sqlite3_stmt* stmt, int col) {
+    const unsigned char* txt = sqlite3_column_text(stmt, col);
+    return txt ? std::string(reinterpret_cast<const char*>(txt)) : std::string();
 }
 
 } // namespace anónimo
@@ -80,32 +96,78 @@ QuarantineVault::~QuarantineVault() {
 }
 
 void QuarantineVault::initializeKey() {
-    if (std::filesystem::exists(m_keyPath)) {
+    constexpr size_t kKeySize = 32; // Clave AES de 256 bits
+    std::error_code ec;
+
+    // 1. Intentar cargar la clave existente (protegida con DPAPI a nivel de equipo)
+    if (std::filesystem::exists(m_keyPath, ec)) {
         std::ifstream kFile(m_keyPath, std::ios::binary);
         if (kFile.is_open()) {
-            m_aesKey.resize(32); // Clave AES de 256 bits (32 bytes)
-            kFile.read(reinterpret_cast<char*>(m_aesKey.data()), 32);
-            if (kFile.gcount() == 32) {
-                return;
+            std::vector<uint8_t> blob((std::istreambuf_iterator<char>(kFile)),
+                                      std::istreambuf_iterator<char>());
+            kFile.close();
+
+            if (!blob.empty()) {
+                DATA_BLOB in{};
+                in.cbData = static_cast<DWORD>(blob.size());
+                in.pbData = blob.data();
+                DATA_BLOB out{};
+
+                if (CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)) {
+                    if (out.cbData == kKeySize) {
+                        m_aesKey.assign(out.pbData, out.pbData + kKeySize);
+                    }
+                    SecureZeroMemory(out.pbData, out.cbData);
+                    LocalFree(out.pbData);
+                    if (m_aesKey.size() == kKeySize) return;
+                    m_aesKey.clear();
+                } else if (blob.size() == kKeySize) {
+                    // Formato heredado (clave en claro de versiones previas): se reutiliza y se
+                    // reescribe protegida más abajo para no perder acceso a los elementos aislados.
+                    m_aesKey = blob;
+                } else {
+                    // Blob ilegible (otro equipo o corrupción): conservarlo antes de crear una clave nueva.
+                    SetFileAttributesW(m_keyPath.wstring().c_str(), FILE_ATTRIBUTE_NORMAL);
+                    std::filesystem::rename(m_keyPath, m_keyPath.wstring() + L".bak", ec);
+                }
             }
         }
     }
 
-    // Generar nueva clave criptográfica aleatoria mediante BCryptGenRandom
-    m_aesKey.resize(32);
-    BCryptGenRandom(nullptr, m_aesKey.data(), static_cast<ULONG>(m_aesKey.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-
-    std::ofstream kFile(m_keyPath, std::ios::binary | std::ios::trunc);
-    if (kFile.is_open()) {
-        kFile.write(reinterpret_cast<const char*>(m_aesKey.data()), m_aesKey.size());
+    // 2. Generar nueva clave aleatoria mediante BCryptGenRandom si no hay una válida
+    if (m_aesKey.size() != kKeySize) {
+        m_aesKey.assign(kKeySize, 0);
+        BCryptGenRandom(nullptr, m_aesKey.data(), static_cast<ULONG>(m_aesKey.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     }
 
-    // Ocultar el archivo de clave en Windows
+    // 3. Persistir la clave cifrada con DPAPI (CRYPTPROTECT_LOCAL_MACHINE permite al servicio y al CLI compartirla)
+    DATA_BLOB plain{};
+    plain.cbData = static_cast<DWORD>(m_aesKey.size());
+    plain.pbData = m_aesKey.data();
+    DATA_BLOB protectedBlob{};
+
+    std::vector<uint8_t> toWrite;
+    if (CryptProtectData(&plain, L"OpenGuard Quarantine Key", nullptr, nullptr, nullptr,
+                         CRYPTPROTECT_LOCAL_MACHINE, &protectedBlob)) {
+        toWrite.assign(protectedBlob.pbData, protectedBlob.pbData + protectedBlob.cbData);
+        LocalFree(protectedBlob.pbData);
+    } else {
+        toWrite = m_aesKey; // DPAPI no disponible: último recurso
+    }
+
+    // Un archivo oculto/de sistema no puede sobrescribirse directamente: restablecer atributos primero
+    SetFileAttributesW(m_keyPath.wstring().c_str(), FILE_ATTRIBUTE_NORMAL);
+    {
+        std::ofstream kFile(m_keyPath, std::ios::binary | std::ios::trunc);
+        if (kFile.is_open()) {
+            kFile.write(reinterpret_cast<const char*>(toWrite.data()), static_cast<std::streamsize>(toWrite.size()));
+        }
+    }
     SetFileAttributesW(m_keyPath.wstring().c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
 }
 
 void QuarantineVault::initializeDatabase() {
-    std::string pathUtf8 = m_dbPath.string();
+    const std::string pathUtf8 = paths::toUtf8(m_dbPath); // SQLite exige UTF-8
     int rc = sqlite3_open_v2(
         pathUtf8.c_str(),
         &m_dbHandle,
@@ -114,6 +176,7 @@ void QuarantineVault::initializeDatabase() {
     );
 
     if (rc == SQLITE_OK && m_dbHandle) {
+        sqlite3_busy_timeout(m_dbHandle, 5000);
         const char* ddl =
             "CREATE TABLE IF NOT EXISTS quarantine_items ("
             "    qid            TEXT PRIMARY KEY,"
@@ -284,9 +347,15 @@ std::optional<QuarantineItem> QuarantineVault::quarantineFile(
     outEnc.write(VAULT_MAGIC, 4);
     uint64_t origSize64 = static_cast<uint64_t>(fileSize);
     outEnc.write(reinterpret_cast<const char*>(&origSize64), sizeof(origSize64));
-    outEnc.write(reinterpret_cast<const char*>(iv.data()), iv.size());
-    outEnc.write(reinterpret_cast<const char*>(cipherData.data()), cipherData.size());
+    outEnc.write(reinterpret_cast<const char*>(iv.data()), static_cast<std::streamsize>(iv.size()));
+    outEnc.write(reinterpret_cast<const char*>(cipherData.data()), static_cast<std::streamsize>(cipherData.size()));
+    outEnc.flush();
+    const bool writeOk = outEnc.good();
     outEnc.close();
+    if (!writeOk) {
+        std::filesystem::remove(encFilePath, ec);
+        return std::nullopt; // Disco lleno u otro error: el archivo original NO se destruye
+    }
 
     // 4. Registrar metadatos en la base de datos de cuarentena
     QuarantineItem item;
@@ -303,9 +372,12 @@ std::optional<QuarantineItem> QuarantineVault::quarantineFile(
         "INSERT INTO quarantine_items (qid, original_path, threat_name, severity, sha256, quarantined_at, size_bytes, enc_file_name) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
 
+    bool recorded = false;
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_dbHandle, insSql, -1, &stmt, nullptr) == SQLITE_OK) {
-        std::string origPathStr = item.originalPath.string();
+        // La ruta se guarda en UTF-8 para conservar caracteres no ASCII
+        const auto origPathU8 = item.originalPath.u8string();
+        const std::string origPathStr(reinterpret_cast<const char*>(origPathU8.data()), origPathU8.size());
         sqlite3_bind_text(stmt, 1, item.qid.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, origPathStr.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, item.threatName.c_str(), -1, SQLITE_TRANSIENT);
@@ -315,8 +387,14 @@ std::optional<QuarantineItem> QuarantineVault::quarantineFile(
         sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(item.sizeBytes));
         sqlite3_bind_text(stmt, 8, item.encryptedFileName.c_str(), -1, SQLITE_TRANSIENT);
 
-        sqlite3_step(stmt);
+        recorded = (sqlite3_step(stmt) == SQLITE_DONE);
         sqlite3_finalize(stmt);
+    }
+
+    if (!recorded) {
+        // Sin registro no habría forma de restaurar: se revierte y se conserva el original
+        std::filesystem::remove(encFilePath, ec);
+        return std::nullopt;
     }
 
     // 5. Destrucción segura del archivo original infectado
@@ -330,21 +408,29 @@ bool QuarantineVault::restoreFile(const std::string& qid, const std::filesystem:
     if (!m_dbHandle || m_aesKey.size() != 32) return false;
 
     // 1. Obtener metadatos desde la base de datos
-    std::string origPath;
+    std::string origPathStr;
     std::string encFileName;
+    std::string expectedSha256;
 
-    const char* sql = "SELECT original_path, enc_file_name FROM quarantine_items WHERE qid = ? LIMIT 1;";
+    const char* sql = "SELECT original_path, enc_file_name, sha256 FROM quarantine_items WHERE qid = ? LIMIT 1;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_dbHandle, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
 
     sqlite3_bind_text(stmt, 1, qid.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        origPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        encFileName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        origPathStr = columnText(stmt, 0);
+        encFileName = columnText(stmt, 1);
+        expectedSha256 = columnText(stmt, 2);
     }
     sqlite3_finalize(stmt);
 
-    if (origPath.empty() || encFileName.empty()) return false;
+    if (origPathStr.empty() || encFileName.empty()) return false;
+
+    // Impedir que un registro manipulado apunte fuera de la bóveda (path traversal)
+    if (encFileName.find_first_of("\\/:") != std::string::npos) return false;
+
+    const std::filesystem::path origPath(
+        std::u8string(reinterpret_cast<const char8_t*>(origPathStr.data()), origPathStr.size()));
 
     // 2. Leer archivo cifrado de la bóveda
     std::filesystem::path encPath = m_filesDir / encFileName;
@@ -353,21 +439,23 @@ bool QuarantineVault::restoreFile(const std::string& qid, const std::filesystem:
 
     char magic[4]{};
     inEnc.read(magic, 4);
-    if (std::memcmp(magic, VAULT_MAGIC, 4) != 0) return false;
+    if (inEnc.gcount() != 4 || std::memcmp(magic, VAULT_MAGIC, 4) != 0) return false;
 
     uint64_t origSize = 0;
     inEnc.read(reinterpret_cast<char*>(&origSize), sizeof(origSize));
 
     std::vector<uint8_t> iv(16);
     inEnc.read(reinterpret_cast<char*>(iv.data()), 16);
+    if (inEnc.gcount() != 16) return false;
 
     std::vector<uint8_t> cipherData((std::istreambuf_iterator<char>(inEnc)),
                                     std::istreambuf_iterator<char>());
     inEnc.close();
+    if (cipherData.empty() || cipherData.size() % 16 != 0) return false;
 
     // 3. Descifrar con BCrypt
     BCRYPT_ALG_HANDLE hAes = nullptr;
-    BCryptOpenAlgorithmProvider(&hAes, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&hAes, BCRYPT_AES_ALGORITHM, nullptr, 0))) return false;
     BCryptSetProperty(
         hAes,
         BCRYPT_CHAINING_MODE,
@@ -377,7 +465,11 @@ bool QuarantineVault::restoreFile(const std::string& qid, const std::filesystem:
     );
 
     BCRYPT_KEY_HANDLE hKey = nullptr;
-    BCryptGenerateSymmetricKey(hAes, &hKey, nullptr, 0, m_aesKey.data(), static_cast<ULONG>(m_aesKey.size()), 0);
+    if (!NT_SUCCESS(BCryptGenerateSymmetricKey(hAes, &hKey, nullptr, 0, m_aesKey.data(),
+                                               static_cast<ULONG>(m_aesKey.size()), 0))) {
+        BCryptCloseAlgorithmProvider(hAes, 0);
+        return false;
+    }
 
     DWORD plainLen = 0;
     std::vector<uint8_t> ivCopy = iv;
@@ -414,25 +506,40 @@ bool QuarantineVault::restoreFile(const std::string& qid, const std::filesystem:
 
     if (!NT_SUCCESS(status)) return false;
 
-    // Truncar al tamaño original si el padding agregó bytes adicionales
-    if (origSize > 0 && origSize < plainData.size()) {
+    // El descifrado devuelve el padding PKCS#7 ya eliminado; se ajusta al tamaño original registrado
+    if (plainLen < plainData.size()) plainData.resize(plainLen);
+    if (origSize < plainData.size()) {
         plainData.resize(static_cast<size_t>(origSize));
     }
 
-    // 4. Restaurar en destino
-    std::filesystem::path target = destinationPath.empty() ? std::filesystem::path(origPath) : destinationPath;
+    // Verificación de integridad (CBC no autentica por sí mismo): el hash debe coincidir con el original
+    if (!expectedSha256.empty()) {
+        const std::string actual = plainData.empty()
+            ? CryptoUtils::computeSha256FromBuffer("", 0)
+            : CryptoUtils::computeSha256FromBuffer(plainData.data(), plainData.size());
+        if (!actual.empty() && actual != expectedSha256) return false;
+    }
+
+    // 4. Restaurar en destino (sin sobrescribir archivos existentes)
+    std::error_code ec;
+    std::filesystem::path target = destinationPath.empty() ? origPath : destinationPath;
+    if (std::filesystem::exists(target, ec)) return false;
     if (target.has_parent_path()) {
-        std::error_code ec;
         std::filesystem::create_directories(target.parent_path(), ec);
     }
 
     std::ofstream outPlain(target, std::ios::binary | std::ios::trunc);
     if (!outPlain.is_open()) return false;
-    outPlain.write(reinterpret_cast<const char*>(plainData.data()), plainData.size());
+    outPlain.write(reinterpret_cast<const char*>(plainData.data()), static_cast<std::streamsize>(plainData.size()));
+    outPlain.flush();
+    const bool restoreOk = outPlain.good();
     outPlain.close();
+    if (!restoreOk) {
+        std::filesystem::remove(target, ec);
+        return false;
+    }
 
     // 5. Eliminar de la cuarentena
-    std::error_code ec;
     std::filesystem::remove(encPath, ec);
 
     sqlite3_stmt* delStmt = nullptr;
@@ -454,12 +561,13 @@ bool QuarantineVault::deletePermanently(const std::string& qid) {
     if (sqlite3_prepare_v2(m_dbHandle, "SELECT enc_file_name FROM quarantine_items WHERE qid = ? LIMIT 1;", -1, &stmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, qid.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
-            encFileName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            encFileName = columnText(stmt, 0);
         }
         sqlite3_finalize(stmt);
     }
 
     if (encFileName.empty()) return false;
+    if (encFileName.find_first_of("\\/:") != std::string::npos) return false; // Evitar path traversal
 
     // Borrado seguro del blob cifrado
     secureDeleteFile(m_filesDir / encFileName);
@@ -484,15 +592,17 @@ std::vector<QuarantineItem> QuarantineVault::listItems() {
     if (sqlite3_prepare_v2(m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             QuarantineItem item;
-            item.qid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-            item.originalPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-            item.threatName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-            item.severity = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-            item.sha256 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-            item.quarantinedAt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+            item.qid = columnText(stmt, 0);
+            const std::string pathU8 = columnText(stmt, 1);
+            item.originalPath = std::filesystem::path(
+                std::u8string(reinterpret_cast<const char8_t*>(pathU8.data()), pathU8.size()));
+            item.threatName = columnText(stmt, 2);
+            item.severity = columnText(stmt, 3);
+            item.sha256 = columnText(stmt, 4);
+            item.quarantinedAt = columnText(stmt, 5);
             item.sizeBytes = static_cast<size_t>(sqlite3_column_int64(stmt, 6));
-            item.encryptedFileName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-            items.push_back(item);
+            item.encryptedFileName = columnText(stmt, 7);
+            items.push_back(std::move(item));
         }
         sqlite3_finalize(stmt);
     }

@@ -98,9 +98,36 @@ public:
                     size_t& skipped);
 
     /**
+     * @brief Importa firmas desde un archivo JSON con el formato de signatures/hashes_index.json.
+     * @details Los registros con hashes malformados se descartan sin abortar la importación.
+     *          Es idempotente: las firmas ya presentes se omiten.
+     * @param jsonPath Ruta del archivo JSON.
+     * @param[out] inserted Firmas nuevas insertadas.
+     * @param[out] skipped Firmas descartadas por duplicadas o inválidas.
+     * @return true si el archivo fue procesado; false si no existe, es inválido o la base es de solo lectura.
+     */
+    bool importFromJson(const std::filesystem::path& jsonPath, size_t& inserted, size_t& skipped);
+
+    /**
+     * @brief Importa una lista de hashes en texto plano (uno por línea; SHA-256, SHA-1 o MD5; "#" = comentario).
+     * @param text Contenido de la lista.
+     * @param malwareName Nombre de detección asignado a todos los hashes de la lista.
+     * @param source Origen registrado (ej: "bazaar").
+     * @param[out] inserted Hashes nuevos.
+     * @param[out] skipped Líneas inválidas o duplicadas.
+     */
+    bool importHashList(const std::string& text, const std::string& malwareName, const std::string& source,
+                        size_t& inserted, size_t& skipped);
+
+    /**
      * @brief Inserta las firmas estándar de prueba EICAR para verificación defensiva inofensiva.
      */
     void seedEicar();
+
+    /**
+     * @brief Indica si la base se abrió en modo solo lectura (usuario sin permisos de escritura).
+     */
+    [[nodiscard]] bool isReadOnly() const noexcept { return m_readOnly; }
 
     /**
      * @brief Obtiene las métricas cuantitativas actuales de la base de datos.
@@ -124,6 +151,7 @@ private:
     sqlite3* m_dbHandle{nullptr};
     mutable std::mutex m_mutex;
     bool m_initialized{false};
+    bool m_readOnly{false};
 };
 
 } // namespace openguard
