@@ -51,6 +51,7 @@ TEST_F(HardeningFixture, SettingsRoundTripAndDefaults) {
 
     openguard::ProtectionSettings s;
     s.autoQuarantine = false;
+    s.usbMode = "off"; // scanUsb se deriva de usbMode al cargar
     s.scanUsb = false;
     s.cpuPercent = 25;
     s.exclusions = {fs::path(L"C:\\Datos\\Proyectos \u00F1and\u00FA"), fs::path(L"D:\\Juegos\\saves.dat")};

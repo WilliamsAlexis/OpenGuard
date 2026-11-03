@@ -178,8 +178,11 @@ TEST_F(SecretFixture, StoresEncryptedAndRoundTrips) {
     EXPECT_EQ(*got, key);
 
     // En disco no debe aparecer en texto plano
-    std::ifstream f(m_dir / "abusech_auth_key.bin", std::ios::binary);
-    const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string raw;
+    {   // el flujo debe cerrarse: Windows no permite borrar un archivo abierto
+        std::ifstream f(m_dir / "abusech_auth_key.bin", std::ios::binary);
+        raw.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
     EXPECT_FALSE(raw.empty());
     EXPECT_EQ(raw.find(key), std::string::npos);
 
