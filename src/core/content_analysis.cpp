@@ -72,6 +72,10 @@ ContentAnalysis analyzeContent(const std::vector<uint8_t>& data, const std::file
         ScanResult tmp;
         HeuristicsEngine::addScriptThreat(report, tmp);
         for (auto& t : tmp.threats) out.threats.push_back(std::move(t));
+    } else if (isOfficeExtension(ext)) {
+        ScanResult tmp;
+        HeuristicsEngine::addOfficeThreat(analyzeOfficeMacros(data.data(), data.size(), ext), tmp);
+        for (auto& t : tmp.threats) out.threats.push_back(std::move(t));
     }
 
     out.ok = true;

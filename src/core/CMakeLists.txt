@@ -22,6 +22,7 @@ add_library(openguard_core STATIC
     isolated_scan.cpp
     settings.cpp
     history.cpp
+    office_macros.cpp
 )
 
 target_include_directories(openguard_core PUBLIC

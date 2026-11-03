@@ -23,6 +23,23 @@
 namespace openguard {
 
 /**
+ * @struct ScanProgress
+ * @brief Estado de avance de un análisis, para barras de progreso reales.
+ */
+struct ScanProgress {
+    size_t processed{0};   ///< Archivos ya analizados u omitidos.
+    size_t discovered{0};  ///< Archivos encontrados hasta el momento.
+    size_t total{0};       ///< Total conocido (0 = se desconoce: análisis en streaming).
+    size_t threats{0};     ///< Amenazas encontradas hasta el momento.
+    bool finished{false};  ///< El análisis terminó (o se canceló).
+
+    /// Fracción completada (0.0 a 1.0); 0 si el total se desconoce.
+    [[nodiscard]] double fraction() const noexcept {
+        return total ? static_cast<double>(processed) / static_cast<double>(total) : 0.0;
+    }
+};
+
+/**
  * @struct ScannerConfig
  * @brief Parámetros de configuración operativa del escáner.
  */
@@ -37,6 +54,11 @@ struct ScannerConfig {
     std::filesystem::path yaraRulesDir;         ///< Carpeta con reglas *.yar (vacía = motor YARA desactivado).
     /// Si se define, scanFile() delega en este analizador (p. ej. el proceso aislado del servicio).
     std::function<ScanResult(const std::filesystem::path&)> customAnalyzer;
+    /// true: se enumeran todos los archivos antes de analizar, de modo que el progreso tiene un total real
+    /// (rápido/carpeta). false: análisis en streaming para discos enormes (el total se desconoce).
+    bool precount{false};
+    /// Notificación de avance tras cada archivo procesado (se invoca desde el hilo que llama a scanPaths).
+    std::function<void(const ScanProgress&)> onProgress;
 };
 
 /**

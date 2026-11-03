@@ -345,10 +345,15 @@ std::optional<ScanResult> IsolatedScanner::scan(const std::filesystem::path& fil
                          "El archivo utiliza una extension doble potencialmente enganosa");
     }
 
+    // 4b. Ubicación sospechosa (se calcula aquí: el trabajador no conoce la ruta real)
+    if (auto loc = HeuristicsEngine::suspiciousLocation(filePath)) {
+        result.addThreat(loc->name, loc->method, loc->severity, loc->score, loc->details);
+    }
+
     // 5. Detecciones del trabajador. Solo se aceptan métodos de contenido: un trabajador comprometido no
     //    puede fabricar una coincidencia de firma (hash_signature) que provoque un aislamiento automático.
     for (const auto& t : content.threats) {
-        if (t.method != "yara" && t.method != "heuristic_script") continue;
+        if (t.method != "yara" && t.method != "heuristic_script" && t.method != "heuristic_office") continue;
         result.addThreat(t.name.substr(0, 128), t.method, t.severity.substr(0, 16), t.score, t.details.substr(0, 1024));
     }
 

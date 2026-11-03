@@ -9,12 +9,14 @@
 #pragma once
 
 #include "openguard/types.h"
+#include "openguard/office_macros.h"
 #include "openguard/pe_analyzer.h"
 
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace openguard {
 
@@ -87,6 +89,15 @@ public:
 
     /// Convierte un informe de script en una amenaza heurística (si su puntuación es > 0).
     static void addScriptThreat(const ScriptReport& report, ScanResult& result);
+
+    /// Convierte un informe de macros de Office en una amenaza heurística (solo si hay macros).
+    static void addOfficeThreat(const MacroReport& report, ScanResult& result);
+
+    /**
+     * @brief Indicio débil por la ubicación: ejecutables/scripts en carpetas temporales, AppData\Roaming, Papelera,
+     *        Public o Descargas. Por sí solo nunca llega al umbral de amenaza; suma a otros indicios.
+     */
+    [[nodiscard]] static std::optional<ThreatInfo> suspiciousLocation(const std::filesystem::path& file);
 
 private:
     std::unique_ptr<PEAnalyzer> m_peAnalyzer;

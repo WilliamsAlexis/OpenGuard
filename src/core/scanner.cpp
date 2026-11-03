@@ -128,6 +128,25 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
         }
     }
 
+    // 4c. Ubicación sospechosa (indicio débil que suma a otros)
+    if (auto loc = HeuristicsEngine::suspiciousLocation(filePath)) {
+        result.addThreat(loc->name, loc->method, loc->severity, loc->score, loc->details);
+    }
+
+    // 4d. Macros de Office (primeros 8 MB del documento)
+    {
+        const std::string officeExt = paths::extensionLower(filePath);
+        if (isOfficeExtension(officeExt) && fileSize > 0 && fileSize <= 64u * 1024u * 1024u) {
+            std::ifstream in(filePath, std::ios::binary);
+            if (in.is_open()) {
+                std::vector<uint8_t> head(std::min<size_t>(static_cast<size_t>(fileSize), 8u * 1024u * 1024u));
+                in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+                head.resize(static_cast<size_t>(in.gcount()));
+                HeuristicsEngine::addOfficeThreat(analyzeOfficeMacros(head.data(), head.size(), officeExt), result);
+            }
+        }
+    }
+
     // 5. Análisis heurístico profundo de PE y scripts
     if (m_heuristics) {
         ScanResult heurResult = m_heuristics->evaluate(filePath);
@@ -207,6 +226,20 @@ ScanSessionStats FileScanner::scanPaths(
         return false;
     };
 
+    // Avance: en modo precount el total es real; en streaming solo se conocen los archivos descubiertos
+    size_t discovered = 0;
+    size_t knownTotal = 0;
+    auto report = [&](bool finished) {
+        if (!m_config.onProgress) return;
+        ScanProgress p;
+        p.processed = session.filesScanned + session.filesSkipped;
+        p.discovered = discovered;
+        p.total = knownTotal;
+        p.threats = session.threatsFound;
+        p.finished = finished;
+        m_config.onProgress(p);
+    };
+
     // Los archivos se procesan por lotes: así un escaneo completo (millones de archivos)
     // no acumula todas las tareas y resultados en memoria.
     constexpr size_t kBatchSize = 512;
@@ -219,6 +252,13 @@ ScanSessionStats FileScanner::scanPaths(
 
         for (const auto& fPath : batch) {
             futures.push_back(m_threadPool->enqueue([this, fPath]() {
+                if (this->m_cancelRequested) { // cancelación: los archivos aún no iniciados se omiten sin analizarlos
+                    ScanResult cancelled;
+                    cancelled.filePath = fPath;
+                    cancelled.skipped = true;
+                    cancelled.error = "Analisis cancelado";
+                    return cancelled;
+                }
                 return this->scanFile(fPath);
             }));
         }
@@ -248,44 +288,66 @@ ScanSessionStats FileScanner::scanPaths(
             } catch (...) {
                 session.filesSkipped++;
             }
+            report(false);
         }
     };
 
-    for (const auto& basePath : targetPaths) {
-        if (m_cancelRequested) break;
-
-        std::error_code ec;
-        const auto st = fs::status(basePath, ec);
-        if (ec || !fs::exists(st)) continue;
-
-        if (fs::is_regular_file(st)) {
-            batch.push_back(basePath);
-            if (batch.size() >= kBatchSize) flushBatch();
-            continue;
-        }
-        if (!fs::is_directory(st)) continue;
-
-        fs::recursive_directory_iterator it(basePath, fs::directory_options::skip_permission_denied, ec);
-        const fs::recursive_directory_iterator endIt;
-
-        while (!ec && it != endIt) {
+    // Enumeración de archivos (común a los dos modos): llama a emit() por cada archivo regular encontrado
+    auto enumerate = [&](const std::function<void(const fs::path&)>& emit) {
+        for (const auto& basePath : targetPaths) {
             if (m_cancelRequested) break;
 
-            std::error_code entryEc;
-            const bool isLink = it->is_symlink(entryEc);
+            std::error_code ec;
+            const auto st = fs::status(basePath, ec);
+            if (ec || !fs::exists(st)) continue;
 
-            if (!isLink && it->is_directory(entryEc)) {
-                if (isExcluded(it->path())) it.disable_recursion_pending();
-            } else if (!isLink && it->is_regular_file(entryEc)) {
-                batch.push_back(it->path());
-                if (batch.size() >= kBatchSize) flushBatch();
+            if (fs::is_regular_file(st)) {
+                emit(basePath);
+                continue;
             }
+            if (!fs::is_directory(st)) continue;
 
-            it.increment(ec);
+            fs::recursive_directory_iterator it(basePath, fs::directory_options::skip_permission_denied, ec);
+            const fs::recursive_directory_iterator endIt;
+
+            while (!ec && it != endIt) {
+                if (m_cancelRequested) break;
+
+                std::error_code entryEc;
+                const bool isLink = it->is_symlink(entryEc);
+
+                if (!isLink && it->is_directory(entryEc)) {
+                    if (isExcluded(it->path())) it.disable_recursion_pending();
+                } else if (!isLink && it->is_regular_file(entryEc)) {
+                    emit(it->path());
+                }
+
+                it.increment(ec);
+            }
         }
-    }
+    };
 
-    if (!batch.empty()) flushBatch();
+    if (m_config.precount) {
+        std::vector<fs::path> all;
+        enumerate([&](const fs::path& p) { all.push_back(p); ++discovered; });
+        knownTotal = all.size();
+        report(false);
+
+        for (size_t i = 0; i < all.size() && !m_cancelRequested; i += kBatchSize) {
+            const size_t end = std::min(all.size(), i + kBatchSize);
+            batch.assign(all.begin() + static_cast<std::ptrdiff_t>(i), all.begin() + static_cast<std::ptrdiff_t>(end));
+            flushBatch();
+        }
+    } else {
+        enumerate([&](const fs::path& p) {
+            batch.push_back(p);
+            ++discovered;
+            if (batch.size() >= kBatchSize) flushBatch();
+        });
+        if (!batch.empty()) flushBatch();
+        knownTotal = discovered;
+    }
+    report(true);
 
     auto endClock = std::chrono::high_resolution_clock::now();
     session.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endClock - startClock);

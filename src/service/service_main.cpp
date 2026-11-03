@@ -188,6 +188,8 @@ public:
     }
 
     void stop() {
+        if (m_schedScanner) m_schedScanner->cancelScan(); // un análisis programado en curso se interrumpe
+        if (m_scheduleThread.joinable()) m_scheduleThread.join();
         m_monitor.stop();
         removeDecoys();
         for (auto& t : m_usbThreads) {
@@ -200,6 +202,7 @@ public:
     /// Llamada periódica: detecta unidades extraíbles recién conectadas.
     void poll() {
         checkDecoys();
+        checkSchedule();
         if (m_isolated && m_isolated->degraded() && !m_degradedLogged) {
             m_degradedLogged = true;
             g_log.write("WARN", "Analisis aislado en modo degradado: no se pudo aplicar el token restringido (solo Job Object)");
@@ -305,6 +308,74 @@ private:
     std::shared_ptr<openguard::IsolatedScanner> m_isolated;
     bool m_degradedLogged{false};
     bool m_networkBlocked{false};
+
+    // ----------------------------------------------------------------- análisis programados
+
+    static std::wstring statusIniPath() { return (openguard::paths::dataDir() / L"status.ini").wstring(); }
+
+    std::time_t readLastScheduledRun() const {
+        wchar_t buf[64]{};
+        GetPrivateProfileStringW(L"schedule", L"last_run", L"", buf, 64, statusIniPath().c_str());
+        const std::wstring w(buf);
+        return openguard::parseLocalStamp(std::string(w.begin(), w.end()));
+    }
+
+    void writeLastScheduledRun(std::time_t t) const {
+        const std::string s = openguard::formatLocalStamp(t);
+        const std::wstring w(s.begin(), s.end());
+        WritePrivateProfileStringW(L"schedule", L"last_run", w.c_str(), statusIniPath().c_str());
+    }
+
+    /// Se invoca cada ~5 s: lanza el análisis programado cuando corresponde (con puesta al día si el equipo estaba apagado).
+    void checkSchedule() {
+        if (!m_set.schedule.enabled || m_scheduleRunning) return;
+
+        const std::time_t now = std::time(nullptr);
+        const std::time_t last = readLastScheduledRun();
+        if (last == 0) { // primera vez: se fija la referencia sin ejecutar nada en este instante
+            writeLastScheduledRun(now);
+            return;
+        }
+        if (!openguard::scheduleIsDue(m_set.schedule, now, last)) return;
+
+        writeLastScheduledRun(now); // se anota ya, para no relanzarlo mientras corre
+        startScheduledScan();
+    }
+
+    void startScheduledScan() {
+        if (m_scheduleThread.joinable()) m_scheduleThread.join(); // el anterior ya terminó (m_scheduleRunning == false)
+        m_scheduleRunning = true;
+
+        const bool full = (m_set.schedule.type == "full");
+        openguard::ScannerConfig cfg = m_config;
+        cfg.precount = false;
+        m_schedScanner = std::make_shared<openguard::FileScanner>(m_db, cfg);
+        g_log.write("INFO", std::string("Analisis programado iniciado (") + (full ? "completo" : "rapido") + ")");
+        hist("scan", "INFO", {}, full ? "Analisis programado completo" : "Analisis programado rapido", "iniciado");
+
+        auto scanner = m_schedScanner;
+        m_scheduleThread = std::thread([this, scanner, full]() {
+            try {
+                const std::vector<fs::path> targets = full ? openguard::FileScanner::getFixedDrives() : collectWatchDirectories();
+                auto session = scanner->scanPaths(targets, full ? openguard::ScanType::Full : openguard::ScanType::Quick);
+                for (const auto& r : session.results) {
+                    if (r.isThreat()) handleResult(r);
+                }
+                g_log.write("INFO", "Analisis programado completado: " + std::to_string(session.filesScanned) + " archivos, " +
+                                        std::to_string(session.threatsFound) + " amenazas");
+                hist("scan", "INFO", {}, full ? "Analisis programado completo" : "Analisis programado rapido",
+                     "completado", {}, std::to_string(session.filesScanned) + " archivos, " + std::to_string(session.threatsFound) +
+                                            " amenazas, " + std::to_string(session.duration.count() / 1000) + " s");
+            } catch (const std::exception& e) {
+                g_log.write("ERROR", std::string("Analisis programado fallo: ") + e.what());
+            }
+            m_scheduleRunning = false;
+        });
+    }
+
+    std::thread m_scheduleThread;
+    std::shared_ptr<openguard::FileScanner> m_schedScanner;
+    std::atomic<bool> m_scheduleRunning{false};
 
     /// Estado del aislamiento para la GUI: %ProgramData%\OpenGuard\status.ini
     void writeIsolationStatus(const char* mode) {

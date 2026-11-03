@@ -10,7 +10,9 @@
 
 #include <fstream>
 #include <algorithm>
+#include <cwctype>
 #include <iterator>
+#include <unordered_set>
 
 namespace openguard {
 
@@ -246,6 +248,40 @@ void HeuristicsEngine::addScriptThreat(const ScriptReport& scRep, ScanResult& re
         scRep.riskScore,
         joinReasons(scRep.findings)
     );
+}
+
+void HeuristicsEngine::addOfficeThreat(const MacroReport& rep, ScanResult& result) {
+    if (!rep.hasMacros || rep.score <= 0) return;
+    result.addThreat("Heuristic.Office.Macro", "heuristic_office", severityFromScore(rep.score), rep.score, joinReasons(rep.findings));
+}
+
+std::optional<ThreatInfo> HeuristicsEngine::suspiciousLocation(const std::filesystem::path& file) {
+    static const std::unordered_set<std::string> kRiskyExt = {
+        ".exe", ".dll", ".scr", ".com", ".pif", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".jar"};
+    if (kRiskyExt.find(paths::extensionLower(file)) == kRiskyExt.end()) return std::nullopt;
+
+    std::wstring w = file.wstring();
+    for (auto& c : w) {
+        c = (c == L'/') ? L'\\' : static_cast<wchar_t>(std::towlower(c));
+    }
+    auto has = [&w](const wchar_t* part) { return w.find(part) != std::wstring::npos; };
+
+    int score = 0;
+    const char* where = "";
+    if (has(L"\\appdata\\local\\temp\\") || has(L"\\windows\\temp\\")) { score = 15; where = "una carpeta temporal"; }
+    else if (has(L"\\$recycle.bin\\")) { score = 15; where = "la Papelera de reciclaje"; }
+    else if (has(L"\\appdata\\roaming\\")) { score = 10; where = "AppData\\Roaming"; }
+    else if (has(L"\\users\\public\\")) { score = 10; where = "la carpeta publica de usuarios"; }
+    else if (has(L"\\downloads\\")) { score = 5; where = "Descargas"; }
+    if (score == 0) return std::nullopt;
+
+    ThreatInfo t;
+    t.name = "Heuristic.SuspiciousLocation";
+    t.method = "heuristic_path";
+    t.severity = "low";
+    t.score = score;
+    t.details = std::string("Ejecutable o script ubicado en ") + where;
+    return t;
 }
 
 ScanResult HeuristicsEngine::evaluate(const std::filesystem::path& filePath) {

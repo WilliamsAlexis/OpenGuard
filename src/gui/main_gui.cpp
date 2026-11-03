@@ -26,6 +26,7 @@
 #include <shlobj.h>
 
 #include <atomic>
+#include <ctime>
 #include <algorithm>
 #include <cwctype>
 #include <filesystem>
@@ -71,7 +72,7 @@ constexpr COLORREF C_SIDE_TEXT = RGB(190, 205, 220);
 
 // ----------------------------------------------------------------------------- ids y mensajes
 
-enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS }; // PG_EXCLUSIONS: subpágina sin entrada en el menú
+enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
@@ -82,7 +83,9 @@ enum : int {
     ID_APP_CHECK, ID_APP_INSTALL, ID_APP_PAGE,
     ID_CPU_25, ID_CPU_50, ID_CPU_75, ID_CPU_100,
     ID_EXCL_OPEN, ID_EXCL_ADD_DIR, ID_EXCL_ADD_FILE, ID_EXCL_REMOVE, ID_EXCL_BACK,
-    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD
+    ID_SCHED_OPEN, ID_SCHED_BACK, ID_SCHED_SAVE, ID_SCHED_QUICK, ID_SCHED_FULL, ID_SCHED_DAILY, ID_SCHED_WEEKLY,
+    ID_SCHED_HOUR_UP, ID_SCHED_HOUR_DOWN, ID_SCHED_MIN_UP, ID_SCHED_MIN_DOWN, ID_SCHED_DAY_NEXT,
+    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED
 };
 
 constexpr UINT WM_APP_PROGRESS = WM_APP + 1;
@@ -138,6 +141,7 @@ struct AppState {
     Settings settings;
     openguard::ProtectionSettings prot;                  // configuración compartida con el servicio
     std::unique_ptr<openguard::ThreatHistory> history;   // historial estructurado
+    bool scanTotalKnown{false};                           // el análisis en curso conoce su total (barra determinada)
     std::shared_ptr<openguard::IsolatedScanner> isolated;     // análisis aislado para los análisis manuales
     std::shared_ptr<openguard::FileScanner> isolatedFallback; // respaldo en proceso si el trabajador no puede iniciarse
 } g;
@@ -576,11 +580,25 @@ void showPage(Page p) {
     else if (p == PG_REPORTS) fillReportList();
     else if (p == PG_SETTINGS) loadSettings();
     else if (p == PG_EXCLUSIONS) { loadSettings(); fillExclusionList(); }
+    else if (p == PG_SCHEDULE) loadSettings();
     layoutControls();
     InvalidateRect(g.main, nullptr, FALSE);
 }
 
 // ----------------------------------------------------------------------------- análisis
+
+/// Barra de progreso: indeterminada (marquesina) mientras se desconoce el total; determinada cuando se conoce.
+void setProgressMode(bool marquee) {
+    LONG_PTR style = GetWindowLongPtrW(g.progress, GWL_STYLE);
+    if (marquee) {
+        SetWindowLongPtrW(g.progress, GWL_STYLE, style | PBS_MARQUEE);
+        SendMessageW(g.progress, PBM_SETMARQUEE, TRUE, 30);
+    } else {
+        SendMessageW(g.progress, PBM_SETMARQUEE, FALSE, 0);
+        SetWindowLongPtrW(g.progress, GWL_STYLE, style & ~static_cast<LONG_PTR>(PBS_MARQUEE));
+        SendMessageW(g.progress, PBM_SETRANGE32, 0, 1000);
+    }
+}
 
 void startScan(std::vector<fs::path> targets, openguard::ScanType type) {
     if (g.scanning.exchange(true)) return;
@@ -590,12 +608,21 @@ void startScan(std::vector<fs::path> targets, openguard::ScanType type) {
     g.processed = 0;
     g.scanStatus = L"Analizando...";
     if (g.page != PG_SCAN) showPage(PG_SCAN); else fillThreatList();
-    SendMessageW(g.progress, PBM_SETMARQUEE, TRUE, 30);
+    setProgressMode(true); // mientras se enumeran los archivos el total aún no se conoce
     InvalidateRect(g.main, nullptr, FALSE);
 
     {
+        openguard::ScannerConfig cfg = makeConfig();
+        // Rápido y carpeta: se cuenta antes de analizar y el progreso es real. Completo: streaming (discos enormes)
+        cfg.precount = (type != openguard::ScanType::Full);
+        cfg.onProgress = [](const openguard::ScanProgress& p) {
+            if (p.finished || p.processed % 20 == 0) {
+                PostMessageW(g.main, WM_APP_PROGRESS, static_cast<WPARAM>(p.processed), static_cast<LPARAM>(p.total ? p.total : p.discovered));
+            }
+        };
         std::lock_guard<std::mutex> lock(g.scannerMutex);
-        g.scanner = std::make_shared<openguard::FileScanner>(g.db, makeConfig());
+        g.scanner = std::make_shared<openguard::FileScanner>(g.db, cfg);
+        g.scanTotalKnown = cfg.precount;
     }
 
     g.worker = std::thread([targets = std::move(targets), type]() {
@@ -620,7 +647,8 @@ void onScanDone(openguard::ScanSessionStats* stats) {
     std::unique_ptr<openguard::ScanSessionStats> owned(stats);
     if (g.worker.joinable()) g.worker.join();
     g.scanning = false;
-    SendMessageW(g.progress, PBM_SETMARQUEE, FALSE, 0);
+    setProgressMode(false);
+    SendMessageW(g.progress, PBM_SETPOS, 1000, 0);
 
     g.threats.clear();
     for (const auto& r : owned->results) {
@@ -993,7 +1021,7 @@ void paintSidebar(HDC hdc, int h) {
     int y = S(104);
     for (int i = 0; i < PG_COUNT; ++i) {
         RECT item = R(0, y, sw, y + S(48));
-        const bool sel = (g.page == i) || (i == PG_SETTINGS && g.page == PG_EXCLUSIONS);
+        const bool sel = (g.page == i) || (i == PG_SETTINGS && (g.page == PG_EXCLUSIONS || g.page == PG_SCHEDULE));
         if (sel || isHot(NAV_BASE + i)) fillRect(hdc, item, C_SIDE_HOT);
         if (sel) fillRect(hdc, R(0, y, S(4), y + S(48)), C_ACCENT);
         text(hdc, glyphs[i], R(S(24), y, S(52), y + S(48)), g.fIcon, sel ? C_ACCENT : C_SIDE_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1031,6 +1059,8 @@ std::wstring isolationText() {
     if (mode == L"off") return L"Desactivado en la configuracion";
     return L"Sin datos (inicie la proteccion en tiempo real)";
 }
+
+std::wstring scheduleSummary(); // definida con la pantalla de programación
 
 void paintHome(HDC hdc, int w, int h) {
     pageHeader(hdc, w, L"Inicio", L"Estado general de la proteccion de su equipo");
@@ -1085,6 +1115,7 @@ void paintHome(HDC hdc, int w, int h) {
     const std::pair<std::wstring, std::wstring> rows[] = {
         {L"Proteccion en tiempo real", svcText},
         {L"Analisis aislado", isolationText()},
+        {L"Analisis programado", scheduleSummary()},
         {L"Ultimo analisis", lastScan + (lastThreats == L"-" ? L"" : L"  (" + lastThreats + L" amenazas)")},
         {L"Ultima actualizacion de firmas", lastUpdate},
         {L"Motor", W(std::string("OpenGuard ") + OPENGUARD_VERSION) + L"  |  Firmas + YARA + Heuristica PE/Scripts"},
@@ -1239,9 +1270,89 @@ void paintSettings(HDC hdc, int w, int h) {
                running ? L"Desactivar proteccion" : L"Activar proteccion", ID_TOGGLE_PROTECTION, running ? BS_SECONDARY : BS_PRIMARY);
 
     const int by = bottomButtonsTop(h);
-    drawButton(hdc, R(body.left, by, body.left + S(220), by + S(40)), L"Guardar y aplicar", ID_SAVE_SETTINGS, BS_PRIMARY);
-    drawButton(hdc, R(body.left + S(232), by, body.left + S(232) + S(300), by + S(40)),
+    drawButton(hdc, R(body.left, by, body.left + S(190), by + S(40)), L"Guardar y aplicar", ID_SAVE_SETTINGS, BS_PRIMARY);
+    drawButton(hdc, R(body.left + S(202), by, body.left + S(202) + S(210), by + S(40)),
                L"Exclusiones (" + std::to_wstring(g.prot.exclusions.size()) + L")...", ID_EXCL_OPEN, BS_SECONDARY);
+    drawButton(hdc, R(body.left + S(424), by, body.left + S(424) + S(210), by + S(40)),
+               g.prot.schedule.enabled ? L"Programacion (activa)..." : L"Programacion...", ID_SCHED_OPEN, BS_SECONDARY);
+}
+
+/// Texto "Próximo análisis" / "Último análisis programado" para la pantalla de programación e Inicio.
+std::wstring scheduleSummary() {
+    const auto& s = g.prot.schedule;
+    if (!s.enabled) return L"Desactivado";
+    static const wchar_t* kDays[7] = {L"domingo", L"lunes", L"martes", L"miercoles", L"jueves", L"viernes", L"sabado"};
+    wchar_t hm[8];
+    swprintf(hm, std::size(hm), L"%02d:%02d", s.hour, s.minute);
+    std::wstring when = (s.frequency == "weekly") ? std::wstring(L"cada ") + kDays[s.weekday % 7] : std::wstring(L"todos los dias");
+    const std::time_t next = openguard::scheduleNextRun(s, std::time(nullptr));
+    const std::string nextText = openguard::formatLocalStamp(next);
+    return std::wstring(s.type == "full" ? L"Completo, " : L"Rapido, ") + when + L" a las " + hm +
+           (nextText.empty() ? L"" : L" (proximo: " + W(nextText.substr(0, 16)) + L")");
+}
+
+void paintSchedule(HDC hdc, int w, int h) {
+    pageHeader(hdc, w, L"Programacion de analisis", L"Ejecute analisis automaticos aunque no tenga abierta la aplicacion (los realiza el servicio)");
+    const RECT body = bodyRect(w, h);
+    auto& s = g.prot.schedule;
+
+    const int rowH = S(60);
+    RECT card = R(body.left, body.top, body.right, body.top + rowH * 5 + S(8));
+    drawCard(hdc, card);
+    int y = card.top + S(4);
+    const int right = card.right - S(20);
+
+    auto label = [&](int rowY, const wchar_t* title, const wchar_t* desc) {
+        text(hdc, title, R(card.left + S(22), rowY + S(8), card.left + S(330), rowY + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, desc, R(card.left + S(22), rowY + S(30), card.left + S(330), rowY + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    };
+    auto sep = [&](int rowY) { fillRect(hdc, R(card.left + S(20), rowY - 1, card.right - S(20), rowY), C_BORDER); };
+
+    // 1. Activar
+    label(y, L"Analisis programado", L"Activa o desactiva la programacion.");
+    drawToggle(hdc, right - S(46), y + (rowH - S(24)) / 2, s.enabled, TOG_SCHED);
+    y += rowH; sep(y);
+
+    // 2. Tipo
+    label(y, L"Tipo de analisis", L"Rapido: zonas de riesgo. Completo: todas las unidades.");
+    drawButton(hdc, R(right - S(230), y + S(10), right - S(120), y + S(10) + S(38)), L"Rapido", ID_SCHED_QUICK, s.type == "quick" ? BS_PRIMARY : BS_SECONDARY);
+    drawButton(hdc, R(right - S(110), y + S(10), right, y + S(10) + S(38)), L"Completo", ID_SCHED_FULL, s.type == "full" ? BS_PRIMARY : BS_SECONDARY);
+    y += rowH; sep(y);
+
+    // 3. Frecuencia
+    label(y, L"Frecuencia", L"Con que periodicidad se ejecuta.");
+    drawButton(hdc, R(right - S(230), y + S(10), right - S(120), y + S(10) + S(38)), L"Diario", ID_SCHED_DAILY, s.frequency == "daily" ? BS_PRIMARY : BS_SECONDARY);
+    drawButton(hdc, R(right - S(110), y + S(10), right, y + S(10) + S(38)), L"Semanal", ID_SCHED_WEEKLY, s.frequency == "weekly" ? BS_PRIMARY : BS_SECONDARY);
+    y += rowH; sep(y);
+
+    // 4. Hora
+    label(y, L"Hora", L"Hora local. Si el equipo esta apagado, se ejecuta al encenderlo.");
+    wchar_t hh[8], mm[8];
+    swprintf(hh, std::size(hh), L"%02d", s.hour);
+    swprintf(mm, std::size(mm), L"%02d", s.minute);
+    int bx = right - S(300);
+    drawButton(hdc, R(bx, y + S(10), bx + S(38), y + S(48)), L"-", ID_SCHED_HOUR_DOWN, BS_SECONDARY);
+    text(hdc, hh, R(bx + S(40), y + S(10), bx + S(82), y + S(48)), g.fH2, C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    drawButton(hdc, R(bx + S(84), y + S(10), bx + S(122), y + S(48)), L"+", ID_SCHED_HOUR_UP, BS_SECONDARY);
+    text(hdc, L":", R(bx + S(124), y + S(10), bx + S(140), y + S(48)), g.fH2, C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    drawButton(hdc, R(bx + S(142), y + S(10), bx + S(180), y + S(48)), L"-", ID_SCHED_MIN_DOWN, BS_SECONDARY);
+    text(hdc, mm, R(bx + S(182), y + S(10), bx + S(224), y + S(48)), g.fH2, C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    drawButton(hdc, R(bx + S(226), y + S(10), bx + S(264), y + S(48)), L"+", ID_SCHED_MIN_UP, BS_SECONDARY);
+    y += rowH; sep(y);
+
+    // 5. Dia (solo semanal)
+    static const wchar_t* kDays[7] = {L"Domingo", L"Lunes", L"Martes", L"Miercoles", L"Jueves", L"Viernes", L"Sabado"};
+    label(y, L"Dia de la semana", L"Solo para la frecuencia semanal (pulse para cambiar).");
+    drawButton(hdc, R(right - S(200), y + S(10), right, y + S(10) + S(38)), kDays[s.weekday % 7], ID_SCHED_DAY_NEXT, BS_SECONDARY, s.frequency == "weekly");
+
+    // Resumen
+    const std::wstring last = iniGetStr(openguard::paths::dataDir() / L"status.ini", L"schedule", L"last_run", L"Nunca");
+    text(hdc, L"Programacion: " + scheduleSummary(), R(body.left, card.bottom + S(16), body.right, card.bottom + S(40)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"Ultima ejecucion programada: " + last, R(body.left, card.bottom + S(42), body.right, card.bottom + S(66)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+
+    const int by = bottomButtonsTop(h);
+    drawButton(hdc, R(body.left, by, body.left + S(220), by + S(40)), L"Guardar y aplicar", ID_SCHED_SAVE, BS_PRIMARY);
+    drawButton(hdc, R(body.left + S(232), by, body.left + S(232) + S(140), by + S(40)), L"Volver", ID_SCHED_BACK, BS_SECONDARY);
 }
 
 void paintExclusions(HDC hdc, int w, int h) {
@@ -1267,6 +1378,7 @@ void paintAll(HDC hdc, int w, int h) {
         case PG_REPORTS:    paintReports(hdc, w, h); break;
         case PG_SETTINGS:   paintSettings(hdc, w, h); break;
         case PG_EXCLUSIONS: paintExclusions(hdc, w, h); break;
+        case PG_SCHEDULE:   paintSchedule(hdc, w, h); break;
         default: break;
     }
 }
@@ -1329,6 +1441,26 @@ void onHit(int id) {
         case ID_CPU_100: g.prot.cpuPercent = 100; break;
         case ID_EXCL_OPEN: showPage(PG_EXCLUSIONS); break;
         case ID_EXCL_BACK: showPage(PG_SETTINGS); break;
+        case ID_SCHED_OPEN: showPage(PG_SCHEDULE); break;
+        case ID_SCHED_BACK: showPage(PG_SETTINGS); break;
+        case TOG_SCHED: g.prot.schedule.enabled = !g.prot.schedule.enabled; break;
+        case ID_SCHED_QUICK: g.prot.schedule.type = "quick"; break;
+        case ID_SCHED_FULL: g.prot.schedule.type = "full"; break;
+        case ID_SCHED_DAILY: g.prot.schedule.frequency = "daily"; break;
+        case ID_SCHED_WEEKLY: g.prot.schedule.frequency = "weekly"; break;
+        case ID_SCHED_HOUR_UP: g.prot.schedule.hour = (g.prot.schedule.hour + 1) % 24; break;
+        case ID_SCHED_HOUR_DOWN: g.prot.schedule.hour = (g.prot.schedule.hour + 23) % 24; break;
+        case ID_SCHED_MIN_UP: g.prot.schedule.minute = (g.prot.schedule.minute + 5) % 60; break;
+        case ID_SCHED_MIN_DOWN: g.prot.schedule.minute = (g.prot.schedule.minute + 55) % 60; break;
+        case ID_SCHED_DAY_NEXT: g.prot.schedule.weekday = (g.prot.schedule.weekday + 1) % 7; break;
+        case ID_SCHED_SAVE:
+            if (!g.prot.save()) {
+                MessageBoxW(g.main, L"No se pudo guardar la programacion (ejecute OpenGuard como Administrador).", L"OpenGuard", MB_OK | MB_ICONWARNING);
+            } else {
+                restartProtectionIfRunning();
+                MessageBoxW(g.main, L"Programacion guardada. Se aplico reiniciando la proteccion.", L"OpenGuard", MB_OK | MB_ICONINFORMATION);
+            }
+            break;
         case ID_EXCL_ADD_DIR:
         case ID_EXCL_ADD_FILE: {
             fs::path chosen;
@@ -1496,10 +1628,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_APPCHECK) { if (g.settings.checkAppUpdates) startAppCheck(true); return 0; }
             if (wp == TIMER_REFRESH && !g.scanning) { refreshData(); InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
-        case WM_APP_PROGRESS:
-            g.scanStatus = L"Analizando... " + std::to_wstring(static_cast<size_t>(wp)) + L" archivos procesados";
+        case WM_APP_PROGRESS: {
+            const size_t processed = static_cast<size_t>(wp);
+            const size_t total = static_cast<size_t>(lp);
+            if (g.scanTotalKnown && total > 0) {
+                setProgressMode(false);
+                const size_t pos = std::min<size_t>(1000, processed * 1000 / total);
+                SendMessageW(g.progress, PBM_SETPOS, static_cast<WPARAM>(pos), 0);
+                g.scanStatus = L"Analizando... " + std::to_wstring(processed) + L" de " + std::to_wstring(total) +
+                               L" archivos (" + std::to_wstring(pos / 10) + L"%)";
+            } else {
+                g.scanStatus = L"Analizando... " + std::to_wstring(processed) + L" archivos analizados (" +
+                               std::to_wstring(total) + L" encontrados hasta ahora)";
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        }
         case WM_APP_DONE:
             onScanDone(reinterpret_cast<openguard::ScanSessionStats*>(lp));
             return 0;
