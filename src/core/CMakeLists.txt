@@ -16,6 +16,7 @@ add_library(openguard_core STATIC
     realtime_monitor.cpp
     yara_lite.cpp
     net_update.cpp
+    updater.cpp
 )
 
 target_include_directories(openguard_core PUBLIC

@@ -1,0 +1,29 @@
+#include <windows.h>
+
+// Icono de la aplicacion (ID 1) y manifiesto (Common Controls 6, ejecucion como administrador, DPI)
+1 ICON "../../assets/openguard.ico"
+1 24 "openguard_gui.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,2,0,0
+ PRODUCTVERSION 0,2,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Alexis Williams\0"
+            VALUE "FileDescription", "OpenGuard Antivirus\0"
+            VALUE "FileVersion", "0.2.0\0"
+            VALUE "ProductName", "OpenGuard Antivirus\0"
+            VALUE "ProductVersion", "0.2.0\0"
+            VALUE "LegalCopyright", "MIT License\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

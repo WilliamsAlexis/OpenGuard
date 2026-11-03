@@ -102,6 +102,7 @@ Logger g_log;
 class ProtectionEngine {
 public:
     bool start() {
+        loadSettings();
         m_db = std::make_shared<openguard::SignatureDB>(openguard::paths::databasePath());
         if (!m_db->isOpen()) {
             g_log.write("ERROR", "No se pudo abrir la base de firmas: " +
@@ -132,7 +133,7 @@ public:
         g_log.write("INFO", "Motor YARA: " + std::to_string(m_scanner->yaraRuleCount()) + " reglas cargadas");
 
         const auto dirs = collectWatchDirectories();
-        createDecoys(dirs);
+        if (m_enableDecoys) createDecoys(dirs);
         const bool started = m_monitor.start(dirs, [this](const fs::path& p) { onFileChanged(p); });
         g_log.write(started ? "INFO" : "ERROR",
                     started ? "Proteccion en tiempo real activa en " + std::to_string(m_monitor.watchedCount()) + " carpetas"
@@ -158,7 +159,7 @@ public:
         checkDecoys();
         const std::set<wchar_t> current = currentRemovableDrives();
         for (wchar_t letter : current) {
-            if (m_knownRemovable.insert(letter).second) {
+            if (m_knownRemovable.insert(letter).second && m_scanUsb) {
                 const fs::path root = std::wstring{letter, L':', L'\\'};
                 g_log.write("INFO", "Unidad extraible detectada: " + openguard::paths::toUtf8(root) + " - iniciando analisis");
                 m_usbThreads.emplace_back([this, root]() { scanRemovable(root); });
@@ -224,6 +225,20 @@ private:
         const fs::path rel = path.lexically_relative(dir);
         return !rel.empty() && *rel.begin() != "..";
     }
+
+    /// Ajustes editables desde la GUI (config.ini en la carpeta de datos de OpenGuard)
+    void loadSettings() {
+        const std::wstring ini = (openguard::paths::dataDir() / L"config.ini").wstring();
+        m_autoQuarantine = GetPrivateProfileIntW(L"service", L"auto_quarantine", 1, ini.c_str()) != 0;
+        m_enableDecoys = GetPrivateProfileIntW(L"service", L"decoys", 1, ini.c_str()) != 0;
+        m_scanUsb = GetPrivateProfileIntW(L"service", L"scan_usb", 1, ini.c_str()) != 0;
+        g_log.write("INFO", std::string("Ajustes: cuarentena automatica=") + (m_autoQuarantine ? "si" : "no") +
+                                ", senuelos=" + (m_enableDecoys ? "si" : "no") + ", analisis USB=" + (m_scanUsb ? "si" : "no"));
+    }
+
+    bool m_autoQuarantine{true};
+    bool m_enableDecoys{true};
+    bool m_scanUsb{true};
 
     // ----------------------------------------------------------------- anti-ransomware
 
@@ -367,7 +382,7 @@ private:
 
         // Solo se aísla automáticamente lo confirmado: una heurística puede equivocarse y no debe
         // destruir archivos legítimos del usuario sin su decisión.
-        if (confirmed || r.riskLevel == openguard::RiskLevel::Critical) {
+        if (m_autoQuarantine && (confirmed || r.riskLevel == openguard::RiskLevel::Critical)) {
             const auto& first = r.threats.front();
             auto item = m_vault->quarantineFile(r.filePath, first.name, first.severity, r.sha256);
             if (item) {

@@ -18,6 +18,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Recursos de Windows (icono y manifiesto de la GUI)
+if(WIN32)
+    enable_language(RC)
+endif()
+
 # Opciones de compilación
 option(BUILD_TESTING "Compilar la suite de pruebas unitarias" ON)
 option(BUILD_CLI "Compilar la herramienta de consola openguard_cli" ON)
