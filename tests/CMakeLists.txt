@@ -12,6 +12,7 @@ add_executable(openguard_tests
     test_yara.cpp
     test_update.cpp
     test_app_update.cpp
+    test_hardening.cpp
 )
 
 target_compile_definitions(openguard_tests PRIVATE

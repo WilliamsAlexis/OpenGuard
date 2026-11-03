@@ -19,7 +19,8 @@ namespace openguard {
 namespace {
 
 constexpr size_t kMaxScanBytes = 4 * 1024 * 1024;   // Máximo de bytes inspeccionados por archivo
-constexpr size_t kMaxRegexBytes = 256 * 1024;       // Las regex solo se aplican al inicio del archivo
+constexpr size_t kMaxRegexBytes = 64 * 1024;        // Las regex solo se aplican al inicio del archivo (limita coste y recursión de std::regex)
+constexpr size_t kMaxRegexPatternLen = 256;         // Patrones más largos se descartan al cargar
 
 std::string trim(const std::string& s) {
     size_t b = 0, e = s.size();
@@ -201,6 +202,7 @@ bool parseStringLine(const std::string& line, StringDef& def) {
         const size_t close = value.rfind('/');
         if (close == 0) return false;
         const std::string pattern = value.substr(1, close - 1);
+        if (pattern.empty() || pattern.size() > kMaxRegexPatternLen) return false;
         std::string mods = value.substr(close + 1);
         // Los flags 'i' y 's' pegados a la regex (ej: /abc/i) equivalen a nocase
         if (!mods.empty() && mods[0] != ' ') {

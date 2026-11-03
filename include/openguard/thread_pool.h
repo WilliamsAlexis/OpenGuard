@@ -31,7 +31,7 @@ public:
      * @brief Construye el pool con una cantidad específica de hilos de trabajo.
      * @param numThreads Número de hilos a instanciar (por defecto std::thread::hardware_concurrency()).
      */
-    explicit ThreadPool(size_t numThreads = 0);
+    explicit ThreadPool(size_t numThreads = 0, bool lowPriority = false);
 
     /**
      * @brief Destructor que espera la culminación ordenada de las tareas pendientes.

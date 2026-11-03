@@ -12,6 +12,8 @@
  */
 
 #include "openguard/crypto_utils.h"
+#include "openguard/history.h"
+#include "openguard/settings.h"
 #include "openguard/paths.h"
 #include "openguard/quarantine.h"
 #include "openguard/realtime_monitor.h"
@@ -122,7 +124,9 @@ public:
         g_log.write("INFO", "Base de firmas lista (" + std::to_string(m_db->getStats().totalSignatures) + " firmas)");
 
         openguard::ScannerConfig cfg;
-        cfg.threadCount = 2; // Uso moderado de CPU en segundo plano
+        cfg.threadCount = m_set.threadCount();   // Límite de CPU configurable (Configuración > Rendimiento)
+        cfg.lowPriority = true;                   // El análisis en segundo plano no compite con el usuario
+        for (const auto& ex : m_set.exclusions) cfg.excludedPaths.push_back(ex);
         cfg.excludedPaths.push_back(openguard::paths::dataDir());
         cfg.excludedPaths.push_back(openguard::paths::executableDir());
         cfg.excludedPaths.push_back(openguard::paths::signaturesDir());
@@ -130,6 +134,8 @@ public:
         m_config = cfg;
         m_scanner = std::make_unique<openguard::FileScanner>(m_db, cfg);
         m_vault = std::make_unique<openguard::QuarantineVault>(openguard::paths::quarantineDir());
+        m_history = std::make_unique<openguard::ThreatHistory>(openguard::paths::dataDir() / "history.db");
+        m_history->purgeOlderThan(365); // mantenimiento: conserva un año de historial
         g_log.write("INFO", "Motor YARA: " + std::to_string(m_scanner->yaraRuleCount()) + " reglas cargadas");
 
         const auto dirs = collectWatchDirectories();
@@ -228,14 +234,32 @@ private:
 
     /// Ajustes editables desde la GUI (config.ini en la carpeta de datos de OpenGuard)
     void loadSettings() {
-        const std::wstring ini = (openguard::paths::dataDir() / L"config.ini").wstring();
-        m_autoQuarantine = GetPrivateProfileIntW(L"service", L"auto_quarantine", 1, ini.c_str()) != 0;
-        m_enableDecoys = GetPrivateProfileIntW(L"service", L"decoys", 1, ini.c_str()) != 0;
-        m_scanUsb = GetPrivateProfileIntW(L"service", L"scan_usb", 1, ini.c_str()) != 0;
+        m_set = openguard::ProtectionSettings::load();
+        m_autoQuarantine = m_set.autoQuarantine;
+        m_enableDecoys = m_set.decoys;
+        m_scanUsb = m_set.scanUsb;
         g_log.write("INFO", std::string("Ajustes: cuarentena automatica=") + (m_autoQuarantine ? "si" : "no") +
-                                ", senuelos=" + (m_enableDecoys ? "si" : "no") + ", analisis USB=" + (m_scanUsb ? "si" : "no"));
+                                ", senuelos=" + (m_enableDecoys ? "si" : "no") + ", analisis USB=" + (m_scanUsb ? "si" : "no") +
+                                ", CPU=" + std::to_string(m_set.cpuPercent) + "%, exclusiones=" + std::to_string(m_set.exclusions.size()));
     }
 
+    /// Registra un evento en el historial estructurado (además del log de texto).
+    void hist(const char* kind, const char* level, const std::string& path, const std::string& threat,
+              const std::string& action, const std::string& sha = {}, const std::string& details = {}) {
+        if (!m_history) return;
+        openguard::HistoryEvent e;
+        e.kind = kind;
+        e.level = level;
+        e.path = path;
+        e.threat = threat;
+        e.action = action;
+        e.sha256 = sha;
+        e.details = details;
+        m_history->record(e);
+    }
+
+    openguard::ProtectionSettings m_set;
+    std::unique_ptr<openguard::ThreatHistory> m_history;
     bool m_autoQuarantine{true};
     bool m_enableDecoys{true};
     bool m_scanUsb{true};
@@ -296,6 +320,7 @@ private:
             }
             if (!reason.empty()) {
                 d.alerted = true;
+                hist("ransomware", "ALERT", openguard::paths::toUtf8(d.path), "Senuelo " + reason, "alerta");
                 g_log.write("ALERT", "POSIBLE RANSOMWARE: el archivo senuelo " + openguard::paths::toUtf8(d.path) +
                                          " fue " + reason + ". Desconecte el equipo de la red y revise los procesos activos.");
             }
@@ -327,6 +352,8 @@ private:
 
         if (m_recent.size() >= kBurstThreshold && now - m_lastBurstAlert > kAlertCooldown) {
             m_lastBurstAlert = now;
+            hist("ransomware", "ALERT", openguard::paths::toUtf8(path), "Rafaga de modificaciones", "alerta",
+                 {}, std::to_string(m_recent.size()) + " archivos en 10 s");
             g_log.write("ALERT", "ACTIVIDAD SOSPECHOSA: " + std::to_string(m_recent.size()) +
                                      " archivos modificados en 10 s en carpetas de usuario (posible cifrado masivo). Ultimo: " +
                                      openguard::paths::toUtf8(path));
@@ -344,6 +371,7 @@ private:
         if (isDecoy(path)) return; // El señuelo se vigila aparte (checkDecoys)
         if (isInside(path, openguard::paths::dataDir())) return; // Evita analizar la cuarentena y los logs
         noteActivity(path);
+        if (m_set.isExcluded(path)) return; // exclusiones definidas por el usuario
         if (isIgnoredExtension(path)) return;
 
         openguard::ScanResult result;
@@ -379,6 +407,7 @@ private:
             if (t.method == "hash_signature") confirmed = true;
         }
         g_log.write("ALERT", "Amenaza detectada (" + std::to_string(r.riskScore) + "/100): " + pathStr + " -> " + names);
+        hist("detection", "ALERT", pathStr, names, "detectado", r.sha256, "riesgo " + std::to_string(r.riskScore) + "/100");
 
         // Solo se aísla automáticamente lo confirmado: una heurística puede equivocarse y no debe
         // destruir archivos legítimos del usuario sin su decisión.
@@ -387,6 +416,7 @@ private:
             auto item = m_vault->quarantineFile(r.filePath, first.name, first.severity, r.sha256);
             if (item) {
                 g_log.write("ACTION", "Archivo aislado en cuarentena (id " + item->qid + "): " + pathStr);
+                hist("quarantine", "ACTION", pathStr, first.name, "aislado en cuarentena", r.sha256, "id " + item->qid);
             } else {
                 g_log.write("ERROR", "No se pudo aislar el archivo: " + pathStr);
             }

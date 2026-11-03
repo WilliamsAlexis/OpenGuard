@@ -11,6 +11,8 @@
 #include "openguard/scanner.h"
 #include "openguard/signatures.h"
 #include "openguard/app_update.h"
+#include "openguard/history.h"
+#include "openguard/settings.h"
 #include "openguard/updater.h"
 #include "openguard/yara_lite.h"
 
@@ -68,7 +70,7 @@ constexpr COLORREF C_SIDE_TEXT = RGB(190, 205, 220);
 
 // ----------------------------------------------------------------------------- ids y mensajes
 
-enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT };
+enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS }; // PG_EXCLUSIONS: subpágina sin entrada en el menú
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
@@ -76,6 +78,8 @@ enum : int {
     ID_UPDATE_NOW, ID_IMPORT_FILE, ID_Q_RESTORE, ID_Q_DELETE, ID_Q_REFRESH,
     ID_LOG_OPEN, ID_LOG_REFRESH, ID_TOGGLE_PROTECTION, ID_SAVE_SETTINGS, ID_FIX,
     ID_APP_CHECK, ID_APP_INSTALL, ID_APP_PAGE,
+    ID_CPU_25, ID_CPU_50, ID_CPU_75, ID_CPU_100,
+    ID_EXCL_OPEN, ID_EXCL_ADD_DIR, ID_EXCL_ADD_FILE, ID_EXCL_REMOVE, ID_EXCL_BACK,
     TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD
 };
 
@@ -130,6 +134,8 @@ struct AppState {
     std::wstring scanStatus, updateMsg;
     bool updateOk{true};
     Settings settings;
+    openguard::ProtectionSettings prot;                  // configuración compartida con el servicio
+    std::unique_ptr<openguard::ThreatHistory> history;   // historial estructurado
 } g;
 
 int S(int v) { return static_cast<int>(v * g.scale + 0.5); }
@@ -170,21 +176,21 @@ std::wstring nowText() {
 }
 
 void loadSettings() {
-    g.settings.autoQuarantine = iniGetBool(serviceIni(), L"service", L"auto_quarantine", true);
-    g.settings.decoys = iniGetBool(serviceIni(), L"service", L"decoys", true);
-    g.settings.scanUsb = iniGetBool(serviceIni(), L"service", L"scan_usb", true);
+    g.prot = openguard::ProtectionSettings::load();
+    g.settings.autoQuarantine = g.prot.autoQuarantine;
+    g.settings.decoys = g.prot.decoys;
+    g.settings.scanUsb = g.prot.scanUsb;
     g.settings.notify = iniGetBool(guiIni(), L"gui", L"notifications", true);
     g.settings.checkAppUpdates = iniGetBool(guiIni(), L"gui", L"check_app_updates", true);
 }
 
 bool saveSettings() {
-    const fs::path ini = serviceIni();
-    const BOOL a = WritePrivateProfileStringW(L"service", L"auto_quarantine", g.settings.autoQuarantine ? L"1" : L"0", ini.c_str());
-    const BOOL b = WritePrivateProfileStringW(L"service", L"decoys", g.settings.decoys ? L"1" : L"0", ini.c_str());
-    const BOOL c = WritePrivateProfileStringW(L"service", L"scan_usb", g.settings.scanUsb ? L"1" : L"0", ini.c_str());
+    g.prot.autoQuarantine = g.settings.autoQuarantine;
+    g.prot.decoys = g.settings.decoys;
+    g.prot.scanUsb = g.settings.scanUsb;
     iniSetStr(guiIni(), L"gui", L"notifications", g.settings.notify ? L"1" : L"0");
     iniSetStr(guiIni(), L"gui", L"check_app_updates", g.settings.checkAppUpdates ? L"1" : L"0");
-    return a && b && c;
+    return g.prot.save();
 }
 
 // ----------------------------------------------------------------------------- servicio de Windows
@@ -274,6 +280,8 @@ void loadYaraCount() {
 openguard::ScannerConfig makeConfig() {
     openguard::ScannerConfig cfg;
     cfg.excludedPaths = { openguard::paths::dataDir(), openguard::paths::executableDir(), openguard::paths::signaturesDir() };
+    for (const auto& ex : g.prot.exclusions) cfg.excludedPaths.push_back(ex);
+    cfg.threadCount = g.prot.threadCount();   // límite de CPU elegido por el usuario
     cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
     return cfg;
 }
@@ -462,8 +470,20 @@ void fillQuarantineList() {
 
 void fillReportList() {
     ListView_DeleteAllItems(g.list);
-    setColumns({{L"Fecha", 160}, {L"Tipo", 80}, {L"Evento", 600}});
 
+    // 1) Historial estructurado (detecciones, cuarentena, ransomware)
+    const auto events = g.history ? g.history->recent(500) : std::vector<openguard::HistoryEvent>{};
+    if (!events.empty()) {
+        setColumns({{L"Fecha", 150}, {L"Tipo", 90}, {L"Amenaza / evento", 230}, {L"Accion", 170}, {L"Ruta", 420}});
+        int row = 0;
+        for (const auto& e : events) {
+            addRow(row++, {W(e.timestamp), W(e.kind), W(e.threat), W(e.action), W(e.path)});
+        }
+        return;
+    }
+
+    // 2) Sin historial todavía: se muestra el registro de texto del servicio
+    setColumns({{L"Fecha", 160}, {L"Tipo", 80}, {L"Evento", 600}});
     const fs::path log = openguard::paths::logsDir() / "service.log";
     std::ifstream in(log, std::ios::binary);
     std::vector<std::string> lines;
@@ -483,6 +503,16 @@ void fillReportList() {
     }
 }
 
+void fillExclusionList() {
+    ListView_DeleteAllItems(g.list);
+    setColumns({{L"Ruta excluida del analisis", 760}});
+    int row = 0;
+    for (const auto& p : g.prot.exclusions) addRow(row++, {p.wstring()});
+}
+
+/// Reinicia el servicio (si está activo) para que lea la nueva configuración.
+void restartProtectionIfRunning();
+
 // ----------------------------------------------------------------------------- navegación y controles
 
 RECT bodyRect(int w, int h) { return R(S(264), S(104), w - S(28), h - S(28)); }
@@ -501,7 +531,7 @@ void layoutControls() {
         showList = true;
         showProgress = true;
         listTop = body.top + S(100) + S(16) + S(30) + S(22);
-    } else if (g.page == PG_QUARANTINE || g.page == PG_REPORTS) {
+    } else if (g.page == PG_QUARANTINE || g.page == PG_REPORTS || g.page == PG_EXCLUSIONS) {
         showList = true;
     }
 
@@ -518,6 +548,7 @@ void showPage(Page p) {
     else if (p == PG_QUARANTINE) fillQuarantineList();
     else if (p == PG_REPORTS) fillReportList();
     else if (p == PG_SETTINGS) loadSettings();
+    else if (p == PG_EXCLUSIONS) { loadSettings(); fillExclusionList(); }
     layoutControls();
     InvalidateRect(g.main, nullptr, FALSE);
 }
@@ -565,7 +596,21 @@ void onScanDone(openguard::ScanSessionStats* stats) {
     SendMessageW(g.progress, PBM_SETMARQUEE, FALSE, 0);
 
     g.threats.clear();
-    for (const auto& r : owned->results) if (r.isThreat()) g.threats.push_back(r);
+    for (const auto& r : owned->results) {
+        if (!r.isThreat()) continue;
+        g.threats.push_back(r);
+        if (g.history) {
+            openguard::HistoryEvent e;
+            e.kind = "detection";
+            e.level = "ALERT";
+            e.path = openguard::paths::toUtf8(r.filePath);
+            for (const auto& t : r.threats) { if (!e.threat.empty()) e.threat += ", "; e.threat += t.name; }
+            e.action = "detectado (analisis manual)";
+            e.sha256 = r.sha256;
+            e.details = "riesgo " + std::to_string(r.riskScore) + "/100";
+            g.history->record(e);
+        }
+    }
     if (g.page == PG_SCAN) fillThreatList();
 
     g.scanStatus = L"Completado: " + std::to_wstring(owned->filesScanned) + L" archivos analizados, " +
@@ -590,7 +635,20 @@ void isolateSelected() {
         for (int row : rows) {
             const auto& r = g.threats[static_cast<size_t>(row)];
             const auto& first = r.threats.front();
-            if (vault.quarantineFile(r.filePath, first.name, first.severity, r.sha256)) { ++ok; done.push_back(static_cast<size_t>(row)); }
+            if (vault.quarantineFile(r.filePath, first.name, first.severity, r.sha256)) {
+                ++ok;
+                done.push_back(static_cast<size_t>(row));
+                if (g.history) {
+                    openguard::HistoryEvent e;
+                    e.kind = "quarantine";
+                    e.level = "ACTION";
+                    e.path = openguard::paths::toUtf8(r.filePath);
+                    e.threat = first.name;
+                    e.action = "aislado en cuarentena (manual)";
+                    e.sha256 = r.sha256;
+                    g.history->record(e);
+                }
+            }
             else ++fail;
         }
     } catch (...) { fail = static_cast<int>(rows.size()); }
@@ -908,7 +966,7 @@ void paintSidebar(HDC hdc, int h) {
     int y = S(104);
     for (int i = 0; i < PG_COUNT; ++i) {
         RECT item = R(0, y, sw, y + S(48));
-        const bool sel = (g.page == i);
+        const bool sel = (g.page == i) || (i == PG_SETTINGS && g.page == PG_EXCLUSIONS);
         if (sel || isHot(NAV_BASE + i)) fillRect(hdc, item, C_SIDE_HOT);
         if (sel) fillRect(hdc, R(0, y, S(4), y + S(48)), C_ACCENT);
         text(hdc, glyphs[i], R(S(24), y, S(52), y + S(48)), g.fIcon, sel ? C_ACCENT : C_SIDE_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1100,36 +1158,60 @@ void paintSettings(HDC hdc, int w, int h) {
 
     struct Row { const wchar_t* title; const wchar_t* desc; bool* value; int id; };
     Row rows[] = {
-        {L"Aislar amenazas confirmadas automaticamente", L"Mueve a cuarentena los archivos que coinciden con una firma o tienen riesgo critico.", &g.settings.autoQuarantine, TOG_AUTOQ},
-        {L"Archivos senuelo anti-ransomware", L"Crea archivos ocultos en Documentos y Escritorio y alerta si alguien los modifica.", &g.settings.decoys, TOG_DECOY},
+        {L"Aislar amenazas confirmadas automaticamente", L"Mueve a cuarentena lo que coincide con una firma o tiene riesgo critico.", &g.settings.autoQuarantine, TOG_AUTOQ},
+        {L"Archivos senuelo anti-ransomware", L"Crea archivos ocultos en Documentos y Escritorio y alerta si los modifican.", &g.settings.decoys, TOG_DECOY},
         {L"Analizar unidades USB al conectarlas", L"Revisa automaticamente las memorias y discos extraibles nuevos.", &g.settings.scanUsb, TOG_USB},
         {L"Mostrar notificaciones en la bandeja", L"Avisa cuando el servicio detecta o aisla una amenaza.", &g.settings.notify, TOG_NOTIFY},
-        {L"Buscar actualizaciones del programa automaticamente", L"Comprueba en GitHub si hay una version nueva de OpenGuard al abrir la aplicacion.", &g.settings.checkAppUpdates, TOG_APPUPD},
+        {L"Buscar actualizaciones del programa", L"Comprueba en GitHub si hay una version nueva de OpenGuard al abrir la aplicacion.", &g.settings.checkAppUpdates, TOG_APPUPD},
     };
-    const int rowH = S(64);
-    RECT card = R(body.left, body.top, body.right, body.top + rowH * 5 + S(8));
+    const int rowH = S(56);
+    RECT card = R(body.left, body.top, body.right, body.top + rowH * 6 + S(8));
     drawCard(hdc, card);
     int y = card.top + S(4);
     for (const auto& r : rows) {
-        text(hdc, r.title, R(card.left + S(22), y + S(10), card.right - S(100), y + S(34)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-        text(hdc, r.desc, R(card.left + S(22), y + S(34), card.right - S(100), y + rowH - S(4)), g.fSmall, C_MUTED);
+        text(hdc, r.title, R(card.left + S(22), y + S(8), card.right - S(100), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, r.desc, R(card.left + S(22), y + S(30), card.right - S(100), y + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         drawToggle(hdc, card.right - S(76), y + (rowH - S(24)) / 2, *r.value, r.id);
         y += rowH;
-        if (&r != &rows[4]) fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
+        fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
     }
 
-    const int py = card.bottom + S(14);
-    RECT pc = R(body.left, py, body.right, py + S(72));
+    // Límite de CPU de los análisis
+    text(hdc, L"Uso maximo de CPU en los analisis", R(card.left + S(22), y + S(8), card.right - S(270), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"Menos CPU: analisis mas lentos pero un equipo mas fluido.", R(card.left + S(22), y + S(30), card.right - S(270), y + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    const int cpuIds[4] = {ID_CPU_25, ID_CPU_50, ID_CPU_75, ID_CPU_100};
+    const int cpuVals[4] = {25, 50, 75, 100};
+    int bx = card.right - S(256);
+    for (int i = 0; i < 4; ++i) {
+        const bool selected = (g.prot.cpuPercent == cpuVals[i]);
+        drawButton(hdc, R(bx, y + S(10), bx + S(56), y + S(10) + S(34)), std::to_wstring(cpuVals[i]) + L"%", cpuIds[i], selected ? BS_PRIMARY : BS_SECONDARY);
+        bx += S(62);
+    }
+
+    const int py = card.bottom + S(12);
+    RECT pc = R(body.left, py, body.right, py + S(64));
     drawCard(hdc, pc);
     const bool running = (g.svc == Svc::Running);
-    text(hdc, L"Proteccion en tiempo real", R(pc.left + S(22), pc.top + S(12), pc.right - S(260), pc.top + S(36)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"Proteccion en tiempo real", R(pc.left + S(22), pc.top + S(8), pc.right - S(260), pc.top + S(32)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     text(hdc, running ? L"El servicio esta en ejecucion." : (g.svc == Svc::NotInstalled ? L"El servicio no esta instalado." : L"El servicio esta detenido."),
-         R(pc.left + S(22), pc.top + S(38), pc.right - S(260), pc.top + S(64)), g.fSmall, running ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    drawButton(hdc, R(pc.right - S(236), pc.top + S(18), pc.right - S(20), pc.top + S(58)),
+         R(pc.left + S(22), pc.top + S(32), pc.right - S(260), pc.top + S(56)), g.fSmall, running ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    drawButton(hdc, R(pc.right - S(236), pc.top + S(12), pc.right - S(20), pc.top + S(52)),
                running ? L"Desactivar proteccion" : L"Activar proteccion", ID_TOGGLE_PROTECTION, running ? BS_SECONDARY : BS_PRIMARY);
 
     const int by = bottomButtonsTop(h);
-    drawButton(hdc, R(body.left, by, body.left + S(260), by + S(40)), L"Guardar y aplicar", ID_SAVE_SETTINGS, BS_PRIMARY);
+    drawButton(hdc, R(body.left, by, body.left + S(220), by + S(40)), L"Guardar y aplicar", ID_SAVE_SETTINGS, BS_PRIMARY);
+    drawButton(hdc, R(body.left + S(232), by, body.left + S(232) + S(300), by + S(40)),
+               L"Exclusiones (" + std::to_wstring(g.prot.exclusions.size()) + L")...", ID_EXCL_OPEN, BS_SECONDARY);
+}
+
+void paintExclusions(HDC hdc, int w, int h) {
+    pageHeader(hdc, w, L"Exclusiones", L"Carpetas y archivos que OpenGuard no analizara (use con precaucion)");
+    const RECT body = bodyRect(w, h);
+    const int by = bottomButtonsTop(h);
+    drawButton(hdc, R(body.left, by, body.left + S(190), by + S(40)), L"Agregar carpeta...", ID_EXCL_ADD_DIR, BS_PRIMARY);
+    drawButton(hdc, R(body.left + S(202), by, body.left + S(202) + S(190), by + S(40)), L"Agregar archivo...", ID_EXCL_ADD_FILE, BS_SECONDARY);
+    drawButton(hdc, R(body.left + S(404), by, body.left + S(404) + S(180), by + S(40)), L"Quitar seleccionada", ID_EXCL_REMOVE, BS_DANGER);
+    drawButton(hdc, R(body.right - S(140), by, body.right, by + S(40)), L"Volver", ID_EXCL_BACK, BS_SECONDARY);
 }
 
 void paintAll(HDC hdc, int w, int h) {
@@ -1144,11 +1226,20 @@ void paintAll(HDC hdc, int w, int h) {
         case PG_QUARANTINE: paintQuarantine(hdc, w, h); break;
         case PG_REPORTS:    paintReports(hdc, w, h); break;
         case PG_SETTINGS:   paintSettings(hdc, w, h); break;
+        case PG_EXCLUSIONS: paintExclusions(hdc, w, h); break;
         default: break;
     }
 }
 
 // ----------------------------------------------------------------------------- eventos
+
+void restartProtectionIfRunning() {
+    if (queryService() != Svc::Running) return;
+    std::wstring err;
+    setProtection(false, err);
+    setProtection(true, err);
+    refreshData();
+}
 
 void onHit(int id) {
     if (id >= NAV_BASE && id < NAV_BASE + PG_COUNT) { showPage(static_cast<Page>(id - NAV_BASE)); return; }
@@ -1192,6 +1283,57 @@ void onHit(int id) {
         case TOG_USB: g.settings.scanUsb = !g.settings.scanUsb; break;
         case TOG_NOTIFY: g.settings.notify = !g.settings.notify; break;
         case TOG_APPUPD: g.settings.checkAppUpdates = !g.settings.checkAppUpdates; break;
+        case ID_CPU_25: g.prot.cpuPercent = 25; break;
+        case ID_CPU_50: g.prot.cpuPercent = 50; break;
+        case ID_CPU_75: g.prot.cpuPercent = 75; break;
+        case ID_CPU_100: g.prot.cpuPercent = 100; break;
+        case ID_EXCL_OPEN: showPage(PG_EXCLUSIONS); break;
+        case ID_EXCL_BACK: showPage(PG_SETTINGS); break;
+        case ID_EXCL_ADD_DIR:
+        case ID_EXCL_ADD_FILE: {
+            fs::path chosen;
+            if (id == ID_EXCL_ADD_DIR) {
+                BROWSEINFOW bi{};
+                bi.hwndOwner = g.main;
+                bi.lpszTitle = L"Seleccione la carpeta a excluir";
+                bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+                if (PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi)) {
+                    wchar_t path[MAX_PATH]{};
+                    if (SHGetPathFromIDListW(pidl, path)) chosen = path;
+                    CoTaskMemFree(pidl);
+                }
+            } else {
+                wchar_t file[MAX_PATH]{};
+                OPENFILENAMEW ofn{};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = g.main;
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileNameW(&ofn)) chosen = file;
+            }
+            if (!chosen.empty()) {
+                if (chosen.has_relative_path() == false || chosen == chosen.root_path()) {
+                    MessageBoxW(g.main, L"No se puede excluir una unidad completa.", L"OpenGuard", MB_OK | MB_ICONWARNING);
+                } else {
+                    g.prot.exclusions.push_back(chosen);
+                    if (!g.prot.save()) MessageBoxW(g.main, L"No se pudo guardar (ejecute OpenGuard como Administrador).", L"OpenGuard", MB_OK | MB_ICONWARNING);
+                    else restartProtectionIfRunning();
+                    fillExclusionList();
+                }
+            }
+            break;
+        }
+        case ID_EXCL_REMOVE: {
+            const auto rows = selectedRows();
+            if (rows.empty()) { MessageBoxW(g.main, L"Seleccione una exclusion de la lista.", L"OpenGuard", MB_OK | MB_ICONINFORMATION); break; }
+            for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
+                if (static_cast<size_t>(*it) < g.prot.exclusions.size()) g.prot.exclusions.erase(g.prot.exclusions.begin() + *it);
+            }
+            if (g.prot.save()) restartProtectionIfRunning();
+            fillExclusionList();
+            break;
+        }
         case ID_APP_CHECK: startAppCheck(false); break;
         case ID_APP_INSTALL: startAppInstall(); break;
         case ID_APP_PAGE:
@@ -1201,10 +1343,7 @@ void onHit(int id) {
             if (!saveSettings()) {
                 MessageBoxW(g.main, L"No se pudo guardar la configuracion del servicio.", L"OpenGuard", MB_OK | MB_ICONWARNING);
             } else if (queryService() == Svc::Running) {
-                std::wstring err;
-                setProtection(false, err);
-                setProtection(true, err);
-                refreshData();
+                restartProtectionIfRunning();
                 MessageBoxW(g.main, L"Configuracion guardada. La proteccion se reinicio para aplicar los cambios.", L"OpenGuard", MB_OK | MB_ICONINFORMATION);
             } else {
                 MessageBoxW(g.main, L"Configuracion guardada.", L"OpenGuard", MB_OK | MB_ICONINFORMATION);
@@ -1250,6 +1389,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROGRESS)), g.hInst, nullptr);
 
             loadSettings();
+            g.history = std::make_unique<openguard::ThreatHistory>(openguard::paths::dataDir() / "history.db");
             refreshData();
             loadYaraCount();
             layoutControls();
@@ -1286,7 +1426,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_GETMINMAXINFO: {
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
             mmi->ptMinTrackSize.x = S(980);
-            mmi->ptMinTrackSize.y = S(660);
+            mmi->ptMinTrackSize.y = S(700);
             return 0;
         }
         case WM_MOUSEMOVE: {

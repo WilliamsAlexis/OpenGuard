@@ -7,7 +7,9 @@
 
 #include "openguard/net_update.h"
 #include "openguard/network_scan.h"
+#include "openguard/history.h"
 #include "openguard/paths.h"
+#include "openguard/settings.h"
 #include "openguard/pe_analyzer.h"
 #include "openguard/quarantine.h"
 #include "openguard/scanner.h"
@@ -74,7 +76,8 @@ void printHelp(const std::string& progName) {
               << "  update --online [url] [--auth-key K] [--name N]\n"
               << "                          Descarga por HTTPS un JSON de OpenGuard o una lista de hashes (uno por linea).\n"
               << "  status                  Estado del servicio de proteccion en tiempo real.\n"
-              << "  logs [n]                Muestra las ultimas n lineas (20 por defecto) del registro del servicio.\n\n"
+              << "  logs [n]                Muestra las ultimas n lineas (20 por defecto) del registro del servicio.\n"
+              << "  history [n]             Historial estructurado de detecciones y acciones (20 por defecto).\n\n"
               << "Otros Comandos:\n"
               << "  --help, -h              Muestra esta ayuda en pantalla.\n"
               << "  --version, -v           Informa la version de OpenGuard instalada.\n\n"
@@ -138,6 +141,9 @@ openguard::ScannerConfig makeScannerConfig() {
     cfg.excludedPaths.push_back(openguard::paths::executableDir());
     cfg.excludedPaths.push_back(openguard::paths::signaturesDir());
     cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
+    const auto prot = openguard::ProtectionSettings::load(); // límite de CPU y exclusiones del usuario
+    cfg.threadCount = prot.threadCount();
+    for (const auto& ex : prot.exclusions) cfg.excludedPaths.push_back(ex);
     return cfg;
 }
 
@@ -469,6 +475,23 @@ int wmain(int argc, wchar_t* argv[]) {
         if (command == "network") return runNetworkAudit();
         if (command == "quarantine") return runQuarantine(args);
         if (command == "status") return showServiceStatus();
+        if (command == "history") {
+            size_t n = 20;
+            if (args.size() >= 3) {
+                try { n = std::stoul(args[2]); } catch (...) { n = 20; }
+            }
+            openguard::ThreatHistory history(openguard::paths::dataDir() / "history.db");
+            const auto events = history.recent(n);
+            if (events.empty()) {
+                std::cout << "El historial esta vacio.\n";
+                return kExitOk;
+            }
+            for (const auto& e : events) {
+                std::cout << e.timestamp << " [" << e.level << "] " << e.kind << ": " << e.threat
+                          << " | " << e.action << " | " << e.path << "\n";
+            }
+            return kExitOk;
+        }
         if (command == "logs") {
             size_t n = 20;
             if (args.size() >= 3) {

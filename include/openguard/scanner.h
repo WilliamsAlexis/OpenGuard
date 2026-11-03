@@ -30,6 +30,7 @@ struct ScannerConfig {
     size_t maxFileSizeBytes{256 * 1024 * 1024}; ///< Límite máximo de archivo a hashear (256 MB).
     size_t bufferSizeBytes{65536};              ///< Tamaño del bloque de lectura en bytes (64 KB).
     size_t threadCount{0};                      ///< Hilos concurrentes (0 = automático).
+    bool lowPriority{false};                    ///< Hilos de análisis con prioridad inferior a la normal.
     bool checkDoubleExtensions{true};           ///< Activar heurística de doble extensión sospechosa.
     bool keepCleanResults{false};               ///< Conservar en la sesión también los archivos limpios (consume memoria en escaneos grandes).
     std::vector<std::filesystem::path> excludedPaths; ///< Directorios que se omiten en escaneos recursivos (ej: la cuarentena).

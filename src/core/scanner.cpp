@@ -38,7 +38,7 @@ std::string toLowerStr(std::string str) {
 
 FileScanner::FileScanner(std::shared_ptr<SignatureDB> sigDb, ScannerConfig config)
     : m_sigDb(std::move(sigDb)), m_config(config) {
-    m_threadPool = std::make_unique<ThreadPool>(m_config.threadCount);
+    m_threadPool = std::make_unique<ThreadPool>(m_config.threadCount, m_config.lowPriority);
     m_heuristics = std::make_unique<HeuristicsEngine>();
     if (!m_config.yaraRulesDir.empty()) {
         m_yara = std::make_unique<YaraLite>();

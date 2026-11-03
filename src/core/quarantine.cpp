@@ -17,6 +17,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <chrono>
@@ -73,6 +74,129 @@ std::string columnText(sqlite3_stmt* stmt, int col) {
 }
 
 } // namespace anónimo
+
+// ---------------------------------------------------------------------------------------------
+// Formatos de la bóveda
+//   v1 (heredado): "OGQB" | tamaño(8) | IV(16) | AES-256-CBC
+//   v2 (actual)  : "OGQ2" | tamaño(8) | nonce(12) | etiqueta(16) | AES-256-GCM (autenticado)
+// En v2 la cabecera de 12 bytes se autentica como datos adicionales (AAD): cualquier manipulación
+// del contenido o del tamaño registrado hace fallar el descifrado.
+// ---------------------------------------------------------------------------------------------
+static constexpr char VAULT_MAGIC_V2[4] = {'O', 'G', 'Q', '2'};
+static constexpr size_t kGcmNonceSize = 12;
+static constexpr size_t kGcmTagSize = 16;
+static constexpr size_t kGcmHeaderSize = 4 + 8 + kGcmNonceSize + kGcmTagSize;
+static constexpr uint64_t kMaxQuarantineBytes = 512ull * 1024ull * 1024ull;
+
+namespace {
+
+/// Abre AES-256 en el modo de encadenamiento indicado y genera la clave simétrica.
+bool openAesKey(const std::vector<uint8_t>& key, const wchar_t* mode, ULONG modeBytes,
+                BCRYPT_ALG_HANDLE& hAlg, BCRYPT_KEY_HANDLE& hKey) {
+    hAlg = nullptr;
+    hKey = nullptr;
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0))) return false;
+    if (!NT_SUCCESS(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                                      reinterpret_cast<PBYTE>(const_cast<wchar_t*>(mode)), modeBytes, 0)) ||
+        !NT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, const_cast<PUCHAR>(key.data()),
+                                               static_cast<ULONG>(key.size()), 0))) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        hAlg = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void closeAes(BCRYPT_ALG_HANDLE hAlg, BCRYPT_KEY_HANDLE hKey) {
+    if (hKey) BCryptDestroyKey(hKey);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+}
+
+bool gcmEncrypt(const std::vector<uint8_t>& key, const std::vector<uint8_t>& aad, std::vector<uint8_t>& nonce,
+                const std::vector<uint8_t>& plain, std::vector<uint8_t>& cipher, std::vector<uint8_t>& tag) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    if (!openAesKey(key, BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), hAlg, hKey)) return false;
+
+    nonce.assign(kGcmNonceSize, 0);
+    BCryptGenRandom(nullptr, nonce.data(), static_cast<ULONG>(nonce.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    tag.assign(kGcmTagSize, 0);
+    cipher.assign(plain.size(), 0);
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = nonce.data();
+    info.cbNonce = static_cast<ULONG>(nonce.size());
+    info.pbAuthData = const_cast<PUCHAR>(aad.data());
+    info.cbAuthData = static_cast<ULONG>(aad.size());
+    info.pbTag = tag.data();
+    info.cbTag = static_cast<ULONG>(tag.size());
+
+    ULONG written = 0;
+    uint8_t dummy = 0;
+    const NTSTATUS st = BCryptEncrypt(hKey, plain.empty() ? &dummy : const_cast<PUCHAR>(plain.data()),
+                                      static_cast<ULONG>(plain.size()), &info, nullptr, 0,
+                                      cipher.empty() ? &dummy : cipher.data(), static_cast<ULONG>(cipher.size()), &written, 0);
+    closeAes(hAlg, hKey);
+    return NT_SUCCESS(st);
+}
+
+/// Descifra un blob v2. Devuelve false si la etiqueta de autenticación no coincide (archivo manipulado).
+bool gcmDecrypt(const std::vector<uint8_t>& key, const std::vector<uint8_t>& blob, std::vector<uint8_t>& plain) {
+    if (blob.size() < kGcmHeaderSize) return false;
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    if (!openAesKey(key, BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), hAlg, hKey)) return false;
+
+    std::vector<uint8_t> aad(blob.begin(), blob.begin() + 12);
+    std::vector<uint8_t> nonce(blob.begin() + 12, blob.begin() + 12 + kGcmNonceSize);
+    std::vector<uint8_t> tag(blob.begin() + 12 + kGcmNonceSize, blob.begin() + kGcmHeaderSize);
+    std::vector<uint8_t> cipher(blob.begin() + kGcmHeaderSize, blob.end());
+    plain.assign(cipher.size(), 0);
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = nonce.data();
+    info.cbNonce = static_cast<ULONG>(nonce.size());
+    info.pbAuthData = aad.data();
+    info.cbAuthData = static_cast<ULONG>(aad.size());
+    info.pbTag = tag.data();
+    info.cbTag = static_cast<ULONG>(tag.size());
+
+    ULONG written = 0;
+    uint8_t dummy = 0;
+    const NTSTATUS st = BCryptDecrypt(hKey, cipher.empty() ? &dummy : cipher.data(), static_cast<ULONG>(cipher.size()),
+                                      &info, nullptr, 0, plain.empty() ? &dummy : plain.data(),
+                                      static_cast<ULONG>(plain.size()), &written, 0);
+    closeAes(hAlg, hKey);
+    if (!NT_SUCCESS(st)) return false;
+    plain.resize(written);
+    return true;
+}
+
+/// Descifrado del formato v1 (AES-256-CBC con relleno PKCS#7), conservado para leer bóvedas antiguas.
+bool cbcDecryptLegacy(const std::vector<uint8_t>& key, const std::vector<uint8_t>& iv,
+                      const std::vector<uint8_t>& cipher, std::vector<uint8_t>& plain) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    if (!openAesKey(key, BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), hAlg, hKey)) return false;
+
+    DWORD plainLen = 0;
+    std::vector<uint8_t> ivCopy = iv;
+    BCryptDecrypt(hKey, const_cast<PUCHAR>(cipher.data()), static_cast<ULONG>(cipher.size()), nullptr,
+                  ivCopy.data(), 16, nullptr, 0, &plainLen, BCRYPT_BLOCK_PADDING);
+
+    plain.assign(plainLen, 0);
+    ivCopy = iv;
+    const NTSTATUS st = BCryptDecrypt(hKey, const_cast<PUCHAR>(cipher.data()), static_cast<ULONG>(cipher.size()), nullptr,
+                                      ivCopy.data(), 16, plain.data(), plainLen, &plainLen, BCRYPT_BLOCK_PADDING);
+    closeAes(hAlg, hKey);
+    if (!NT_SUCCESS(st)) return false;
+    plain.resize(plainLen);
+    return true;
+}
+
+} // namespace
 
 QuarantineVault::QuarantineVault(const std::filesystem::path& vaultDir)
     : m_vaultDir(vaultDir),
@@ -243,97 +367,45 @@ std::optional<QuarantineItem> QuarantineVault::quarantineFile(
         return std::nullopt;
     }
 
-    // 1. Leer contenido completo del archivo original
-    std::ifstream src(filePath, std::ios::binary | std::ios::ate);
-    if (!src.is_open()) return std::nullopt;
+    // 1. Abrir con acceso exclusivo de lectura (nadie puede modificarlo ni borrarlo mientras se aísla)
+    HANDLE hSrc = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hSrc == INVALID_HANDLE_VALUE) return std::nullopt;
 
-    size_t fileSize = static_cast<size_t>(src.tellg());
-    src.seekg(0, std::ios::beg);
-
+    LARGE_INTEGER li{};
+    if (!GetFileSizeEx(hSrc, &li) || li.QuadPart < 0 || static_cast<uint64_t>(li.QuadPart) > kMaxQuarantineBytes) {
+        CloseHandle(hSrc);
+        return std::nullopt;
+    }
+    const size_t fileSize = static_cast<size_t>(li.QuadPart);
     std::vector<uint8_t> plainData(fileSize);
-    if (!src.read(reinterpret_cast<char*>(plainData.data()), fileSize)) {
-        return std::nullopt;
+    size_t done = 0;
+    while (done < fileSize) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(fileSize - done, 16u * 1024u * 1024u));
+        DWORD got = 0;
+        if (!ReadFile(hSrc, plainData.data() + done, chunk, &got, nullptr) || got == 0) {
+            CloseHandle(hSrc);
+            return std::nullopt;
+        }
+        done += got;
     }
-    src.close();
+    CloseHandle(hSrc);
 
-    if (sha256.empty()) {
-        sha256 = CryptoUtils::computeSha256FromBuffer(plainData.data(), plainData.size());
-    }
+    // Si el llamador indicó el hash analizado, el contenido actual debe coincidir: evita aislar (y destruir)
+    // un archivo distinto al que se analizó (carrera entre el análisis y el aislamiento).
+    const std::string actualSha = plainData.empty() ? std::string() : CryptoUtils::computeSha256FromBuffer(plainData.data(), plainData.size());
+    for (auto& c : sha256) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (!sha256.empty() && !actualSha.empty() && actualSha != sha256) return std::nullopt;
+    if (sha256.empty()) sha256 = actualSha;
 
-    // 2. Cifrado simétrico AES-256-CBC con Windows CNG
-    BCRYPT_ALG_HANDLE hAes = nullptr;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAes, BCRYPT_AES_ALGORITHM, nullptr, 0);
-    if (!NT_SUCCESS(status)) return std::nullopt;
+    // 2. Cifrado autenticado AES-256-GCM (CNG); la cabecera de 12 bytes se autentica como AAD
+    std::vector<uint8_t> header(12);
+    std::memcpy(header.data(), VAULT_MAGIC_V2, 4);
+    const uint64_t origSize64 = static_cast<uint64_t>(fileSize);
+    std::memcpy(header.data() + 4, &origSize64, 8);
 
-    BCryptSetProperty(
-        hAes,
-        BCRYPT_CHAINING_MODE,
-        reinterpret_cast<PBYTE>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
-        sizeof(BCRYPT_CHAIN_MODE_CBC),
-        0
-    );
-
-    // Vector de Inicialización (IV) de 16 bytes único por archivo
-    std::vector<uint8_t> iv(16);
-    BCryptGenRandom(nullptr, iv.data(), 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-
-    BCRYPT_KEY_HANDLE hKey = nullptr;
-    status = BCryptGenerateSymmetricKey(
-        hAes,
-        &hKey,
-        nullptr,
-        0,
-        m_aesKey.data(),
-        static_cast<ULONG>(m_aesKey.size()),
-        0
-    );
-
-    if (!NT_SUCCESS(status)) {
-        BCryptCloseAlgorithmProvider(hAes, 0);
-        return std::nullopt;
-    }
-
-    // Determinar tamaño de búfer de salida requerido para cifrado con padding
-    DWORD cipherLen = 0;
-    std::vector<uint8_t> ivCopy = iv;
-    status = BCryptEncrypt(
-        hKey,
-        plainData.data(),
-        static_cast<ULONG>(plainData.size()),
-        nullptr,
-        ivCopy.data(),
-        static_cast<ULONG>(ivCopy.size()),
-        nullptr,
-        0,
-        &cipherLen,
-        BCRYPT_BLOCK_PADDING
-    );
-
-    if (!NT_SUCCESS(status) || cipherLen == 0) {
-        BCryptDestroyKey(hKey);
-        BCryptCloseAlgorithmProvider(hAes, 0);
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> cipherData(cipherLen);
-    ivCopy = iv;
-    status = BCryptEncrypt(
-        hKey,
-        plainData.data(),
-        static_cast<ULONG>(plainData.size()),
-        nullptr,
-        ivCopy.data(),
-        static_cast<ULONG>(ivCopy.size()),
-        cipherData.data(),
-        cipherLen,
-        &cipherLen,
-        BCRYPT_BLOCK_PADDING
-    );
-
-    BCryptDestroyKey(hKey);
-    BCryptCloseAlgorithmProvider(hAes, 0);
-
-    if (!NT_SUCCESS(status)) return std::nullopt;
+    std::vector<uint8_t> nonce, tag, cipherData;
+    if (!gcmEncrypt(m_aesKey, header, nonce, plainData, cipherData, tag)) return std::nullopt;
 
     // 3. Escribir archivo cifrado en la bóveda (.qbin)
     std::string qid = generateQID(filePath);
@@ -343,11 +415,10 @@ std::optional<QuarantineItem> QuarantineVault::quarantineFile(
     std::ofstream outEnc(encFilePath, std::ios::binary | std::ios::trunc);
     if (!outEnc.is_open()) return std::nullopt;
 
-    // Cabecera: Magic (4B) + OriginalSize (8B) + IV (16B) + Cifrado
-    outEnc.write(VAULT_MAGIC, 4);
-    uint64_t origSize64 = static_cast<uint64_t>(fileSize);
-    outEnc.write(reinterpret_cast<const char*>(&origSize64), sizeof(origSize64));
-    outEnc.write(reinterpret_cast<const char*>(iv.data()), static_cast<std::streamsize>(iv.size()));
+    // Cabecera v2: Magic (4B) + OriginalSize (8B) + Nonce (12B) + Tag (16B) + Cifrado
+    outEnc.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    outEnc.write(reinterpret_cast<const char*>(nonce.data()), static_cast<std::streamsize>(nonce.size()));
+    outEnc.write(reinterpret_cast<const char*>(tag.data()), static_cast<std::streamsize>(tag.size()));
     outEnc.write(reinterpret_cast<const char*>(cipherData.data()), static_cast<std::streamsize>(cipherData.size()));
     outEnc.flush();
     const bool writeOk = outEnc.good();
@@ -432,82 +503,29 @@ bool QuarantineVault::restoreFile(const std::string& qid, const std::filesystem:
     const std::filesystem::path origPath(
         std::u8string(reinterpret_cast<const char8_t*>(origPathStr.data()), origPathStr.size()));
 
-    // 2. Leer archivo cifrado de la bóveda
+    // 2. Leer el archivo cifrado de la bóveda
     std::filesystem::path encPath = m_filesDir / encFileName;
     std::ifstream inEnc(encPath, std::ios::binary);
     if (!inEnc.is_open()) return false;
-
-    char magic[4]{};
-    inEnc.read(magic, 4);
-    if (inEnc.gcount() != 4 || std::memcmp(magic, VAULT_MAGIC, 4) != 0) return false;
-
-    uint64_t origSize = 0;
-    inEnc.read(reinterpret_cast<char*>(&origSize), sizeof(origSize));
-
-    std::vector<uint8_t> iv(16);
-    inEnc.read(reinterpret_cast<char*>(iv.data()), 16);
-    if (inEnc.gcount() != 16) return false;
-
-    std::vector<uint8_t> cipherData((std::istreambuf_iterator<char>(inEnc)),
-                                    std::istreambuf_iterator<char>());
+    std::vector<uint8_t> blob((std::istreambuf_iterator<char>(inEnc)), std::istreambuf_iterator<char>());
     inEnc.close();
-    if (cipherData.empty() || cipherData.size() % 16 != 0) return false;
 
-    // 3. Descifrar con BCrypt
-    BCRYPT_ALG_HANDLE hAes = nullptr;
-    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&hAes, BCRYPT_AES_ALGORITHM, nullptr, 0))) return false;
-    BCryptSetProperty(
-        hAes,
-        BCRYPT_CHAINING_MODE,
-        reinterpret_cast<PBYTE>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
-        sizeof(BCRYPT_CHAIN_MODE_CBC),
-        0
-    );
-
-    BCRYPT_KEY_HANDLE hKey = nullptr;
-    if (!NT_SUCCESS(BCryptGenerateSymmetricKey(hAes, &hKey, nullptr, 0, m_aesKey.data(),
-                                               static_cast<ULONG>(m_aesKey.size()), 0))) {
-        BCryptCloseAlgorithmProvider(hAes, 0);
+    // 3. Descifrar según el formato: v2 = AES-256-GCM autenticado; v1 (heredado) = AES-256-CBC
+    std::vector<uint8_t> plainData;
+    uint64_t origSize = 0;
+    if (blob.size() >= kGcmHeaderSize && std::memcmp(blob.data(), VAULT_MAGIC_V2, 4) == 0) {
+        std::memcpy(&origSize, blob.data() + 4, 8);
+        if (!gcmDecrypt(m_aesKey, blob, plainData)) return false; // etiqueta inválida: archivo manipulado o clave distinta
+    } else if (blob.size() >= 28 && std::memcmp(blob.data(), VAULT_MAGIC, 4) == 0) {
+        std::memcpy(&origSize, blob.data() + 4, 8);
+        const std::vector<uint8_t> iv(blob.begin() + 12, blob.begin() + 28);
+        const std::vector<uint8_t> cipher(blob.begin() + 28, blob.end());
+        if (cipher.empty() || cipher.size() % 16 != 0 || !cbcDecryptLegacy(m_aesKey, iv, cipher, plainData)) return false;
+    } else {
         return false;
     }
 
-    DWORD plainLen = 0;
-    std::vector<uint8_t> ivCopy = iv;
-    BCryptDecrypt(
-        hKey,
-        cipherData.data(),
-        static_cast<ULONG>(cipherData.size()),
-        nullptr,
-        ivCopy.data(),
-        16,
-        nullptr,
-        0,
-        &plainLen,
-        BCRYPT_BLOCK_PADDING
-    );
-
-    std::vector<uint8_t> plainData(plainLen);
-    ivCopy = iv;
-    NTSTATUS status = BCryptDecrypt(
-        hKey,
-        cipherData.data(),
-        static_cast<ULONG>(cipherData.size()),
-        nullptr,
-        ivCopy.data(),
-        16,
-        plainData.data(),
-        plainLen,
-        &plainLen,
-        BCRYPT_BLOCK_PADDING
-    );
-
-    BCryptDestroyKey(hKey);
-    BCryptCloseAlgorithmProvider(hAes, 0);
-
-    if (!NT_SUCCESS(status)) return false;
-
-    // El descifrado devuelve el padding PKCS#7 ya eliminado; se ajusta al tamaño original registrado
-    if (plainLen < plainData.size()) plainData.resize(plainLen);
+    // Ajustar al tamaño original registrado
     if (origSize < plainData.size()) {
         plainData.resize(static_cast<size_t>(origSize));
     }

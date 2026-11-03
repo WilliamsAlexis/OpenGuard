@@ -5,9 +5,11 @@
 
 #include "openguard/thread_pool.h"
 
+#include <windows.h>
+
 namespace openguard {
 
-ThreadPool::ThreadPool(size_t numThreads) {
+ThreadPool::ThreadPool(size_t numThreads, bool lowPriority) {
     if (numThreads == 0) {
         numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4; // Fallback conservador
@@ -15,7 +17,8 @@ ThreadPool::ThreadPool(size_t numThreads) {
 
     m_workers.reserve(numThreads);
     for (size_t i = 0; i < numThreads; ++i) {
-        m_workers.emplace_back([this]() {
+        m_workers.emplace_back([this, lowPriority]() {
+            if (lowPriority) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); // no compite con las aplicaciones del usuario
             while (true) {
                 std::function<void()> task;
                 {

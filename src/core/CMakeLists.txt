@@ -18,6 +18,8 @@ add_library(openguard_core STATIC
     net_update.cpp
     updater.cpp
     app_update.cpp
+    settings.cpp
+    history.cpp
 )
 
 target_include_directories(openguard_core PUBLIC
