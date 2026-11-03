@@ -11,6 +11,7 @@
 #include "openguard/scanner.h"
 #include "openguard/signatures.h"
 #include "openguard/app_update.h"
+#include "openguard/drive_tools.h"
 #include "openguard/history.h"
 #include "openguard/isolated_scan.h"
 #include "openguard/settings.h"
@@ -22,6 +23,7 @@
 #include <ole2.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <dbt.h>
 #include <shellapi.h>
 #include <shlobj.h>
 
@@ -32,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -85,13 +88,18 @@ enum : int {
     ID_EXCL_OPEN, ID_EXCL_ADD_DIR, ID_EXCL_ADD_FILE, ID_EXCL_REMOVE, ID_EXCL_BACK,
     ID_SCHED_OPEN, ID_SCHED_BACK, ID_SCHED_SAVE, ID_SCHED_QUICK, ID_SCHED_FULL, ID_SCHED_DAILY, ID_SCHED_WEEKLY,
     ID_SCHED_HOUR_UP, ID_SCHED_HOUR_DOWN, ID_SCHED_MIN_UP, ID_SCHED_MIN_DOWN, ID_SCHED_DAY_NEXT,
-    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED
+    ID_USB_MODE,
+    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED, TOG_DOWNLOADS, TOG_TRAY, TOG_AUTOSTART
 };
 
 constexpr UINT WM_APP_PROGRESS = WM_APP + 1;
 constexpr UINT WM_APP_DONE = WM_APP + 2;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 4;
+constexpr UINT WM_APP_USB = WM_APP + 7;     // se conectó una unidad (wParam = letra)
+constexpr UINT WM_APP_SHOW = WM_APP + 8;    // otra instancia pide mostrar la ventana
+enum : int { ID_TRAY_OPEN = 400, ID_TRAY_QUICK, ID_TRAY_TOGGLE, ID_TRAY_EXIT };
+enum : int { ID_DRV_ISOLATE = 5001, ID_DRV_REPAIR, ID_DRV_DETAILS, ID_DRV_CLOSE, ID_DRV_SCAN, ID_DRV_LATER };
 constexpr UINT WM_APP_APPCHECK_DONE = WM_APP + 5;
 constexpr UINT WM_APP_APPDL_DONE = WM_APP + 6;
 constexpr UINT_PTR TIMER_REFRESH = 1;
@@ -104,7 +112,8 @@ enum class Svc { NotInstalled, Stopped, Running, Pending };
 
 struct HitBox { RECT r; int id; };
 
-struct Settings { bool autoQuarantine{true}, decoys{true}, scanUsb{true}, notify{true}, checkAppUpdates{true}; };
+struct Settings { bool autoQuarantine{true}, decoys{true}, scanUsb{true}, notify{true}, checkAppUpdates{true},
+                       scanDownloads{true}, closeToTray{true}, autostart{false}; };
 
 struct DownloadResult { bool ok{false}; std::wstring path; std::wstring error; };
 
@@ -141,7 +150,19 @@ struct AppState {
     Settings settings;
     openguard::ProtectionSettings prot;                  // configuración compartida con el servicio
     std::unique_ptr<openguard::ThreatHistory> history;   // historial estructurado
-    bool scanTotalKnown{false};                           // el análisis en curso conoce su total (barra determinada)
+    bool scanTotalKnown{false};
+    // Unidades externas
+    std::wstring driveRoot;                       // unidad en análisis (vacío si el análisis no es de una unidad)
+    openguard::DriveInspection driveInspection;   // síntomas detectados en esa unidad
+    std::vector<wchar_t> pendingDrives;           // unidades en espera de que termine el análisis actual
+    // Segundo plano
+    bool quitting{false};                         // el usuario eligió Salir (no ocultar en la bandeja)
+    bool trayHintShown{false};
+    HANDLE instanceMutex{nullptr};
+    // Configuración con desplazamiento
+    int settingsScroll{0}, settingsMaxScroll{0};
+    RECT clipRect{};
+    bool clipOn{false};                           // el análisis en curso conoce su total (barra determinada)
     std::shared_ptr<openguard::IsolatedScanner> isolated;     // análisis aislado para los análisis manuales
     std::shared_ptr<openguard::FileScanner> isolatedFallback; // respaldo en proceso si el trabajador no puede iniciarse
 } g;
@@ -183,11 +204,16 @@ std::wstring nowText() {
     return buf;
 }
 
+bool isAutostartEnabled(); // definida junto a runAndWait
+
 void loadSettings() {
     g.prot = openguard::ProtectionSettings::load();
     g.settings.autoQuarantine = g.prot.autoQuarantine;
     g.settings.decoys = g.prot.decoys;
     g.settings.scanUsb = g.prot.scanUsb;
+    g.settings.scanDownloads = g.prot.scanDownloads;
+    g.settings.closeToTray = iniGetBool(guiIni(), L"gui", L"close_to_tray", true);
+    g.settings.autostart = isAutostartEnabled();
     g.settings.notify = iniGetBool(guiIni(), L"gui", L"notifications", true);
     g.settings.checkAppUpdates = iniGetBool(guiIni(), L"gui", L"check_app_updates", true);
 }
@@ -195,7 +221,8 @@ void loadSettings() {
 bool saveSettings() {
     g.prot.autoQuarantine = g.settings.autoQuarantine;
     g.prot.decoys = g.settings.decoys;
-    g.prot.scanUsb = g.settings.scanUsb;
+    g.prot.scanDownloads = g.settings.scanDownloads;
+    iniSetStr(guiIni(), L"gui", L"close_to_tray", g.settings.closeToTray ? L"1" : L"0");
     iniSetStr(guiIni(), L"gui", L"notifications", g.settings.notify ? L"1" : L"0");
     iniSetStr(guiIni(), L"gui", L"check_app_updates", g.settings.checkAppUpdates ? L"1" : L"0");
     return g.prot.save();
@@ -234,6 +261,28 @@ bool runAndWait(const std::wstring& exe, const std::wstring& args) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return code == 0;
+}
+
+fs::path systemExe(const wchar_t* name) {
+    wchar_t dir[MAX_PATH]{};
+    GetSystemDirectoryW(dir, MAX_PATH);
+    return fs::path(dir) / name;
+}
+
+/// ¿Existe la tarea programada que inicia OpenGuard en segundo plano al iniciar sesión?
+bool isAutostartEnabled() {
+    return runAndWait(systemExe(L"schtasks.exe").wstring(), L"/Query /TN \"OpenGuard Tray\"");
+}
+
+/// Crea o elimina la tarea programada "OpenGuard Tray" (inicio en segundo plano con privilegios elevados, sin
+/// pedir confirmación en cada inicio de sesión).
+bool setAutostart(bool enable) {
+    if (enable) {
+        const std::wstring exe = (openguard::paths::executableDir() / L"openguard_gui.exe").wstring();
+        return runAndWait(systemExe(L"schtasks.exe").wstring(),
+                          L"/Create /TN \"OpenGuard Tray\" /TR \"\\\"" + exe + L"\\\" --tray\" /SC ONLOGON /RL HIGHEST /F");
+    }
+    return runAndWait(systemExe(L"schtasks.exe").wstring(), L"/Delete /TN \"OpenGuard Tray\" /F");
 }
 
 /// Activa o desactiva la protección en tiempo real (instala el servicio si hace falta).
@@ -317,6 +366,224 @@ openguard::ScannerConfig makeConfig() {
     return cfg;
 }
 
+// Declaraciones adelantadas: se definen más abajo en este archivo
+void showBalloon(const std::wstring& title, const std::wstring& body, DWORD icon);
+void startScan(std::vector<fs::path> targets, openguard::ScanType type);
+void showPage(Page p);
+void fillThreatList();
+
+/// Muestra la ventana principal (desde la bandeja, otra instancia o un aviso).
+void showMainWindow() {
+    ShowWindow(g.main, IsIconic(g.main) ? SW_RESTORE : SW_SHOWNORMAL);
+    SetForegroundWindow(g.main);
+}
+
+// ----------------------------------------------------------------------------- unidades externas
+
+int showTaskDialog(const std::wstring& title, const std::wstring& instruction, const std::wstring& content,
+                   const std::wstring& expanded, const std::vector<std::pair<int, std::wstring>>& buttons,
+                   PCWSTR icon, bool commandLinks) {
+    std::vector<TASKDIALOG_BUTTON> tdButtons;
+    for (const auto& b : buttons) tdButtons.push_back({b.first, b.second.c_str()});
+
+    TASKDIALOGCONFIG cfg{};
+    cfg.cbSize = sizeof(cfg);
+    cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_EXPAND_FOOTER_AREA | (commandLinks ? TDF_USE_COMMAND_LINKS : 0);
+    cfg.pszWindowTitle = title.c_str();
+    cfg.pszMainInstruction = instruction.c_str();
+    cfg.pszContent = content.c_str();
+    if (!expanded.empty()) {
+        cfg.pszExpandedInformation = expanded.c_str();
+        cfg.pszCollapsedControlText = L"Ver medidas recomendadas";
+        cfg.pszExpandedControlText = L"Ocultar medidas recomendadas";
+    }
+    cfg.pButtons = tdButtons.data();
+    cfg.cButtons = static_cast<UINT>(tdButtons.size());
+    cfg.nDefaultButton = tdButtons.empty() ? 0 : tdButtons[0].nButtonID;
+    cfg.pszMainIcon = icon;
+    cfg.pfCallback = [](HWND hwnd, UINT msg, WPARAM, LPARAM, LONG_PTR) -> HRESULT {
+        if (msg == TDN_CREATED) { // aparece al frente aunque OpenGuard esté oculto en la bandeja
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            SetForegroundWindow(hwnd);
+        }
+        return S_OK;
+    };
+
+    int pressed = 0;
+    if (FAILED(TaskDialogIndirect(&cfg, &pressed, nullptr, nullptr))) return 0;
+    return pressed;
+}
+
+const wchar_t* kDriveMeasures =
+    L"\x2022 No abra ni ejecute archivos de la unidad hasta limpiarla.\n"
+    L"\x2022 Aisle las amenazas en cuarentena con el boton correspondiente.\n"
+    L"\x2022 Use \"Reparar la unidad\" para mostrar archivos ocultos y quitar accesos directos y autorun maliciosos.\n"
+    L"\x2022 Desactive la reproduccion automatica de unidades externas en Configuracion de Windows.\n"
+    L"\x2022 Si las amenazas reaparecen, copie sus documentos a un lugar seguro y formatee la unidad.\n"
+    L"\x2022 Ejecute tambien un analisis completo del equipo.";
+
+void isolateAllThreats(int& ok, int& fail) {
+    ok = 0;
+    fail = 0;
+    try {
+        openguard::QuarantineVault vault(openguard::paths::quarantineDir());
+        for (auto it = g.threats.begin(); it != g.threats.end();) {
+            const auto& first = it->threats.front();
+            if (vault.quarantineFile(it->filePath, first.name, first.severity, it->sha256)) {
+                ++ok;
+                if (g.history) {
+                    openguard::HistoryEvent e;
+                    e.kind = "quarantine";
+                    e.level = "ACTION";
+                    e.path = openguard::paths::toUtf8(it->filePath);
+                    e.threat = first.name;
+                    e.action = "aislado en cuarentena (unidad externa)";
+                    e.sha256 = it->sha256;
+                    g.history->record(e);
+                }
+                it = g.threats.erase(it);
+            } else {
+                ++fail;
+                ++it;
+            }
+        }
+    } catch (...) {
+        fail = static_cast<int>(g.threats.size());
+    }
+}
+
+/// Resultado del análisis de una unidad: amenazas, síntomas de infección y medidas recomendadas, con acciones.
+void finishDriveScan() {
+    const std::wstring root = g.driveRoot;
+    g.driveRoot.clear();
+    g.driveInspection = openguard::inspectDrive(fs::path(root)); // actualizado tras el análisis
+
+    for (;;) {
+        const size_t n = g.threats.size();
+        const bool issues = g.driveInspection.needsRepair();
+
+        if (n == 0 && !issues) {
+            showBalloon(L"Unidad " + root.substr(0, 2), L"No se encontraron amenazas ni sintomas de infeccion.", NIIF_INFO);
+            return;
+        }
+
+        std::wstring instruction = n > 0 ? L"Se encontraron " + std::to_wstring(n) + L" amenazas en la unidad " + root.substr(0, 2)
+                                         : L"La unidad " + root.substr(0, 2) + L" presenta sintomas de infeccion";
+        std::wstring content;
+        size_t shown = 0;
+        for (const auto& r : g.threats) {
+            if (shown++ >= 5) { content += L"...y " + std::to_wstring(n - 5) + L" mas.\n"; break; }
+            content += r.filePath.filename().wstring() + L"  ->  " + (r.threats.empty() ? L"" : W(r.threats.front().name)) + L"\n";
+        }
+        if (issues) {
+            content += L"\nSintomas en la unidad:\n";
+            size_t k = 0;
+            for (const auto& f : g.driveInspection.findings) {
+                if (k++ >= 4) { content += L"...y otros.\n"; break; }
+                content += L"\x2022 " + W(f.description) + L"\n";
+            }
+        }
+        content += L"\nNo abra los archivos de la unidad mientras tanto.";
+
+        std::vector<std::pair<int, std::wstring>> buttons;
+        if (n > 0) buttons.push_back({ID_DRV_ISOLATE, L"Aislar las amenazas en cuarentena\nLos archivos infectados se cifran y se sacan de la unidad."});
+        if (issues) buttons.push_back({ID_DRV_REPAIR, L"Reparar la unidad\nMuestra los archivos ocultos y elimina accesos directos y autorun maliciosos."});
+        buttons.push_back({ID_DRV_DETAILS, L"Ver detalles en OpenGuard"});
+        buttons.push_back({ID_DRV_CLOSE, L"Cerrar"});
+
+        const int choice = showTaskDialog(L"OpenGuard - Unidad externa", instruction, content, kDriveMeasures, buttons,
+                                          n > 0 ? TD_ERROR_ICON : TD_WARNING_ICON, true);
+
+        if (choice == ID_DRV_ISOLATE) {
+            int ok = 0, fail = 0;
+            isolateAllThreats(ok, fail);
+            fillThreatList();
+            refreshData();
+            InvalidateRect(g.main, nullptr, FALSE);
+            if (fail > 0) {
+                MessageBoxW(nullptr, (std::to_wstring(ok) + L" aislados, " + std::to_wstring(fail) +
+                                      L" con error (archivos en uso o sin permisos).").c_str(), L"OpenGuard", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+            }
+            continue; // se vuelve a mostrar el estado actualizado
+        }
+        if (choice == ID_DRV_REPAIR) {
+            const auto res = openguard::repairDrive(g.driveInspection);
+            if (g.history) {
+                openguard::HistoryEvent e;
+                e.kind = "usb_repair";
+                e.level = "ACTION";
+                e.path = openguard::paths::toUtf8(fs::path(root));
+                e.threat = "Reparacion de unidad";
+                e.action = "reparada";
+                e.details = std::to_string(res.unhidden) + " visibles, " + std::to_string(res.removedShortcuts) + " accesos directos y " +
+                            std::to_string(res.removedAutorun) + " autorun eliminados, " + std::to_string(res.failed) + " con error";
+                g.history->record(e);
+            }
+            std::wstring msg = L"Archivos mostrados: " + std::to_wstring(res.unhidden) + L"\nAccesos directos eliminados: " +
+                               std::to_wstring(res.removedShortcuts) + L"\nAutorun eliminados: " + std::to_wstring(res.removedAutorun);
+            if (res.failed) msg += L"\nNo se pudieron corregir: " + std::to_wstring(res.failed);
+            MessageBoxW(nullptr, msg.c_str(), L"Unidad reparada", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+            g.driveInspection = openguard::inspectDrive(fs::path(root));
+            continue;
+        }
+        if (choice == ID_DRV_DETAILS) {
+            showMainWindow();
+            showPage(PG_SCAN);
+        }
+        return;
+    }
+}
+
+void startNextPendingDrive();
+
+/// Lanza el análisis de una unidad y deja anotado que, al terminar, hay que mostrar su resultado.
+void analyzeDrive(wchar_t letter) {
+    const std::wstring root = std::wstring{letter, L':', L'\\'};
+    if (g.scanning) {
+        g.pendingDrives.push_back(letter);
+        showBalloon(L"Unidad " + root.substr(0, 2), L"Se analizara al terminar el analisis en curso.", NIIF_INFO);
+        return;
+    }
+    g.driveRoot = root;
+    g.driveInspection = openguard::inspectDrive(fs::path(root));
+    startScan({fs::path(root)}, openguard::ScanType::USB);
+}
+
+void startNextPendingDrive() {
+    if (g.scanning || g.pendingDrives.empty()) return;
+    const wchar_t letter = g.pendingDrives.front();
+    g.pendingDrives.erase(g.pendingDrives.begin());
+    analyzeDrive(letter);
+}
+
+/// Se conectó un volumen: en modo "preguntar" se pide permiso para analizarlo.
+void onVolumeArrived(wchar_t letter) {
+    if (g.prot.usbMode != "ask") return; // "auto": lo hace el servicio; "off": no se analiza
+
+    static std::map<wchar_t, std::chrono::steady_clock::time_point> lastPrompt;
+    const auto now = std::chrono::steady_clock::now();
+    auto it = lastPrompt.find(letter);
+    if (it != lastPrompt.end() && now - it->second < std::chrono::seconds(10)) return; // el mismo evento llega varias veces
+    lastPrompt[letter] = now;
+
+    const std::wstring root = std::wstring{letter, L':', L'\\'};
+    const UINT type = GetDriveTypeW(root.c_str());
+    if (type != DRIVE_REMOVABLE && type != DRIVE_CDROM && type != DRIVE_FIXED) return; // se ignoran red y RAM
+
+    wchar_t label[MAX_PATH + 1]{};
+    GetVolumeInformationW(root.c_str(), label, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
+    const std::wstring name = label[0] ? std::wstring(label) : std::wstring(L"Unidad sin nombre");
+    const wchar_t* kind = type == DRIVE_CDROM ? L"disco optico" : type == DRIVE_REMOVABLE ? L"unidad extraible" : L"disco externo";
+
+    const std::wstring instruction = L"Se conecto " + std::wstring(kind) + L" " + root.substr(0, 2) + L" (" + name + L")";
+    const std::wstring content = L"Las unidades externas pueden contener virus: autorun, accesos directos falsos, archivos ocultos o programas "
+                                 L"maliciosos. ¿Permite que OpenGuard analice su contenido ahora?\n\nLos archivos solo se leen; nunca se ejecutan.";
+    const int choice = showTaskDialog(L"OpenGuard - Unidad externa", instruction, content, L"",
+                                      {{ID_DRV_SCAN, L"Analizar ahora (recomendado)"}, {ID_DRV_LATER, L"Ahora no"}},
+                                      TD_INFORMATION_ICON, true);
+    if (choice == ID_DRV_SCAN) analyzeDrive(letter);
+}
+
 std::vector<fs::path> quickTargets() {
     auto env = [](const wchar_t* name) {
         wchar_t buf[MAX_PATH * 2]{};
@@ -358,7 +625,15 @@ void text(HDC hdc, const std::wstring& s, RECT rc, HFONT f, COLORREF c,
     SelectObject(hdc, old);
 }
 
-void addHit(RECT rc, int id) { g.hits.push_back({rc, id}); }
+void addHit(RECT rc, int id) {
+    if (g.clipOn) { // contenido desplazable: la parte fuera de la vista no debe ser pulsable
+        RECT inter;
+        if (!IntersectRect(&inter, &rc, &g.clipRect)) return;
+        rc = inter;
+    }
+    g.hits.push_back({rc, id});
+}
+
 bool isHot(int id) { return g.hover == id; }
 
 void drawShield(HDC hdc, int cx, int cy, int size, COLORREF fill, COLORREF check) {
@@ -578,7 +853,7 @@ void showPage(Page p) {
     if (p == PG_SCAN) fillThreatList();
     else if (p == PG_QUARANTINE) fillQuarantineList();
     else if (p == PG_REPORTS) fillReportList();
-    else if (p == PG_SETTINGS) loadSettings();
+    else if (p == PG_SETTINGS) { loadSettings(); g.settingsScroll = 0; }
     else if (p == PG_EXCLUSIONS) { loadSettings(); fillExclusionList(); }
     else if (p == PG_SCHEDULE) loadSettings();
     layoutControls();
@@ -588,6 +863,9 @@ void showPage(Page p) {
 // ----------------------------------------------------------------------------- análisis
 
 /// Barra de progreso: indeterminada (marquesina) mientras se desconoce el total; determinada cuando se conoce.
+void finishDriveScan();        // definidas con el resto del código de unidades externas
+void startNextPendingDrive();
+
 void setProgressMode(bool marquee) {
     LONG_PTR style = GetWindowLongPtrW(g.progress, GWL_STYLE);
     if (marquee) {
@@ -675,6 +953,12 @@ void onScanDone(openguard::ScanSessionStats* stats) {
     iniSetStr(guiIni(), L"stats", L"last_threats", std::to_wstring(owned->threatsFound));
     refreshData();
     InvalidateRect(g.main, nullptr, FALSE);
+
+    // Análisis de una unidad externa: se muestran las medidas y acciones; luego se sigue con la cola de unidades
+    if (!g.driveRoot.empty()) {
+        finishDriveScan();
+        startNextPendingDrive();
+    }
 }
 
 void isolateSelected() {
@@ -1226,23 +1510,56 @@ void paintReports(HDC hdc, int w, int h) {
 void paintSettings(HDC hdc, int w, int h) {
     pageHeader(hdc, w, L"Configuracion", L"Personalice el comportamiento de la proteccion");
     const RECT body = bodyRect(w, h);
+    const int by = bottomButtonsTop(h);
+    const RECT view = R(body.left, body.top, body.right, by - S(12));
 
     struct Row { const wchar_t* title; const wchar_t* desc; bool* value; int id; };
     Row rows[] = {
+        {L"Analizar archivos descargados", L"Analiza cada archivo nuevo de Descargas al terminar de bajar y lo aisla si es una amenaza confirmada.", &g.settings.scanDownloads, TOG_DOWNLOADS},
         {L"Aislar amenazas confirmadas automaticamente", L"Mueve a cuarentena lo que coincide con una firma o tiene riesgo critico.", &g.settings.autoQuarantine, TOG_AUTOQ},
         {L"Archivos senuelo anti-ransomware", L"Crea archivos ocultos en Documentos y Escritorio y alerta si los modifican.", &g.settings.decoys, TOG_DECOY},
-        {L"Analizar unidades USB al conectarlas", L"Revisa automaticamente las memorias y discos extraibles nuevos.", &g.settings.scanUsb, TOG_USB},
-        {L"Mostrar notificaciones en la bandeja", L"Avisa cuando el servicio detecta o aisla una amenaza.", &g.settings.notify, TOG_NOTIFY},
+        {L"Ejecutar en segundo plano al cerrar la ventana", L"OpenGuard sigue en la bandeja del sistema avisando de amenazas y unidades nuevas (recomendado).", &g.settings.closeToTray, TOG_TRAY},
+        {L"Iniciar con Windows en segundo plano", L"Abre OpenGuard al iniciar sesion, sin ventana y con su icono en la bandeja.", &g.settings.autostart, TOG_AUTOSTART},
+        {L"Mostrar notificaciones en la bandeja", L"Avisa cuando se detecta o aisla una amenaza.", &g.settings.notify, TOG_NOTIFY},
         {L"Buscar actualizaciones del programa", L"Comprueba en GitHub si hay una version nueva de OpenGuard al abrir la aplicacion.", &g.settings.checkAppUpdates, TOG_APPUPD},
     };
-    const int rowH = S(56);
-    RECT card = R(body.left, body.top, body.right, body.top + rowH * 6 + S(8));
+    constexpr int kToggleRows = 7;
+    const int rowH = S(60);
+    const int totalRows = kToggleRows + 2; // + unidades externas + CPU
+    const int contentH = rowH * totalRows + S(8) + S(14) + S(72);
+
+    const int viewH = view.bottom - view.top;
+    g.settingsMaxScroll = std::max(0, contentH - viewH);
+    g.settingsScroll = std::clamp(g.settingsScroll, 0, g.settingsMaxScroll);
+
+    // Zona desplazable: todo lo que se dibuja aquí se recorta a la vista
+    SaveDC(hdc);
+    IntersectClipRect(hdc, view.left, view.top, view.right, view.bottom);
+    g.clipOn = true;
+    g.clipRect = view;
+
+    const int top = view.top - g.settingsScroll;
+    RECT card = R(body.left, top, body.right - (g.settingsMaxScroll > 0 ? S(14) : 0), top + rowH * totalRows + S(8));
     drawCard(hdc, card);
     int y = card.top + S(4);
+
     for (const auto& r : rows) {
         text(hdc, r.title, R(card.left + S(22), y + S(8), card.right - S(100), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         text(hdc, r.desc, R(card.left + S(22), y + S(30), card.right - S(100), y + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         drawToggle(hdc, card.right - S(76), y + (rowH - S(24)) / 2, *r.value, r.id);
+        y += rowH;
+        fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
+    }
+
+    // Unidades externas: preguntar / automático / desactivado
+    {
+        text(hdc, L"Unidades externas (USB, tarjetas, discos)", R(card.left + S(22), y + S(8), card.right - S(250), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        const wchar_t* desc = g.prot.usbMode == "auto" ? L"Se analizan automaticamente al conectarlas."
+                            : g.prot.usbMode == "off"  ? L"No se analizan (no recomendado)."
+                                                       : L"Al conectarlas, OpenGuard pregunta si permite el analisis y ofrece reparar la unidad.";
+        text(hdc, desc, R(card.left + S(22), y + S(30), card.right - S(250), y + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        const wchar_t* label = g.prot.usbMode == "auto" ? L"Automatico" : g.prot.usbMode == "off" ? L"Desactivado" : L"Preguntar";
+        drawButton(hdc, R(card.right - S(190), y + S(10), card.right - S(20), y + S(10) + S(38)), label, ID_USB_MODE, BS_SECONDARY);
         y += rowH;
         fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
     }
@@ -1259,17 +1576,27 @@ void paintSettings(HDC hdc, int w, int h) {
         bx += S(62);
     }
 
-    const int py = card.bottom + S(12);
-    RECT pc = R(body.left, py, body.right, py + S(64));
+    // Protección en tiempo real (servicio)
+    const int py = card.bottom + S(14);
+    RECT pc = R(body.left, py, card.right, py + S(72));
     drawCard(hdc, pc);
     const bool running = (g.svc == Svc::Running);
-    text(hdc, L"Proteccion en tiempo real", R(pc.left + S(22), pc.top + S(8), pc.right - S(260), pc.top + S(32)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"Proteccion en tiempo real", R(pc.left + S(22), pc.top + S(10), pc.right - S(260), pc.top + S(34)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     text(hdc, running ? L"El servicio esta en ejecucion." : (g.svc == Svc::NotInstalled ? L"El servicio no esta instalado." : L"El servicio esta detenido."),
-         R(pc.left + S(22), pc.top + S(32), pc.right - S(260), pc.top + S(56)), g.fSmall, running ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    drawButton(hdc, R(pc.right - S(236), pc.top + S(12), pc.right - S(20), pc.top + S(52)),
+         R(pc.left + S(22), pc.top + S(36), pc.right - S(260), pc.top + S(60)), g.fSmall, running ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    drawButton(hdc, R(pc.right - S(236), pc.top + S(16), pc.right - S(20), pc.top + S(56)),
                running ? L"Desactivar proteccion" : L"Activar proteccion", ID_TOGGLE_PROTECTION, running ? BS_SECONDARY : BS_PRIMARY);
 
-    const int by = bottomButtonsTop(h);
+    // Indicador de desplazamiento
+    g.clipOn = false;
+    RestoreDC(hdc, -1);
+    if (g.settingsMaxScroll > 0) {
+        const int trackH = viewH;
+        const int thumbH = std::max(S(40), trackH * viewH / contentH);
+        const int thumbY = view.top + (trackH - thumbH) * g.settingsScroll / g.settingsMaxScroll;
+        roundRect(hdc, R(body.right - S(6), thumbY, body.right - S(2), thumbY + thumbH), S(4), C_BORDER, C_BORDER, false);
+    }
+
     drawButton(hdc, R(body.left, by, body.left + S(190), by + S(40)), L"Guardar y aplicar", ID_SAVE_SETTINGS, BS_PRIMARY);
     drawButton(hdc, R(body.left + S(202), by, body.left + S(202) + S(210), by + S(40)),
                L"Exclusiones (" + std::to_wstring(g.prot.exclusions.size()) + L")...", ID_EXCL_OPEN, BS_SECONDARY);
@@ -1434,6 +1761,12 @@ void onHit(int id) {
         case TOG_DECOY: g.settings.decoys = !g.settings.decoys; break;
         case TOG_USB: g.settings.scanUsb = !g.settings.scanUsb; break;
         case TOG_NOTIFY: g.settings.notify = !g.settings.notify; break;
+        case TOG_DOWNLOADS: g.settings.scanDownloads = !g.settings.scanDownloads; break;
+        case TOG_TRAY: g.settings.closeToTray = !g.settings.closeToTray; break;
+        case TOG_AUTOSTART: g.settings.autostart = !g.settings.autostart; break;
+        case ID_USB_MODE:
+            g.prot.usbMode = (g.prot.usbMode == "ask") ? "auto" : (g.prot.usbMode == "auto") ? "off" : "ask";
+            break;
         case TOG_APPUPD: g.settings.checkAppUpdates = !g.settings.checkAppUpdates; break;
         case ID_CPU_25: g.prot.cpuPercent = 25; break;
         case ID_CPU_50: g.prot.cpuPercent = 50; break;
@@ -1511,7 +1844,13 @@ void onHit(int id) {
         case ID_APP_PAGE:
             if (g.appInfo.pageUrl.rfind("https://", 0) == 0) ShellExecuteW(g.main, L"open", W(g.appInfo.pageUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             break;
-        case ID_SAVE_SETTINGS:
+        case ID_SAVE_SETTINGS: {
+            const bool downloadsWereOn = openguard::ProtectionSettings::load().scanDownloads;
+            const bool autostartWasOn = isAutostartEnabled();
+            if (g.settings.autostart != autostartWasOn && !setAutostart(g.settings.autostart)) {
+                MessageBoxW(g.main, L"No se pudo cambiar el inicio automatico con Windows.", L"OpenGuard", MB_OK | MB_ICONWARNING);
+                g.settings.autostart = autostartWasOn;
+            }
             if (!saveSettings()) {
                 MessageBoxW(g.main, L"No se pudo guardar la configuracion del servicio.", L"OpenGuard", MB_OK | MB_ICONWARNING);
             } else if (queryService() == Svc::Running) {
@@ -1520,7 +1859,15 @@ void onHit(int id) {
             } else {
                 MessageBoxW(g.main, L"Configuracion guardada.", L"OpenGuard", MB_OK | MB_ICONINFORMATION);
             }
+            // Al activar el analisis de descargas se revisa de inmediato lo que ya hay en la carpeta
+            if (!downloadsWereOn && g.settings.scanDownloads && !g.scanning) {
+                wchar_t prof[MAX_PATH * 2]{};
+                if (GetEnvironmentVariableW(L"USERPROFILE", prof, static_cast<DWORD>(std::size(prof)))) {
+                    startScan({fs::path(prof) / L"Downloads"}, openguard::ScanType::Custom);
+                }
+            }
             break;
+        }
         default: break;
     }
     InvalidateRect(g.main, nullptr, FALSE);
@@ -1531,6 +1878,37 @@ int hitTest(int x, int y) {
         if (x >= it->r.left && x < it->r.right && y >= it->r.top && y < it->r.bottom) return it->id;
     }
     return 0;
+}
+
+/// Menú contextual del icono de la bandeja.
+void showTrayMenu() {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, ID_TRAY_OPEN, L"Abrir OpenGuard");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_QUICK, L"Analisis rapido");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, g.svc == Svc::Running ? L"Desactivar proteccion" : L"Activar proteccion");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Salir de OpenGuard");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(g.main); // necesario para que el menú se cierre al pulsar fuera
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.main, nullptr);
+    DestroyMenu(menu);
+    PostMessageW(g.main, WM_NULL, 0, 0);
+
+    switch (cmd) {
+        case ID_TRAY_OPEN: showMainWindow(); break;
+        case ID_TRAY_QUICK:
+            showMainWindow();
+            startScan(quickTargets(), openguard::ScanType::Quick);
+            break;
+        case ID_TRAY_TOGGLE: onHit(ID_TOGGLE_PROTECTION); break;
+        case ID_TRAY_EXIT:
+            g.quitting = true;
+            DestroyWindow(g.main);
+            break;
+        default: break;
+    }
 }
 
 HFONT makeFont(int px, int weight, const wchar_t* face = L"Segoe UI") {
@@ -1657,13 +2035,48 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             onUpdateDone(reinterpret_cast<openguard::UpdateResult*>(lp));
             return 0;
         case WM_APP_TRAY:
-            if (LOWORD(lp) == WM_LBUTTONDBLCLK || LOWORD(lp) == NIN_BALLOONUSERCLICK) {
-                ShowWindow(hwnd, SW_SHOWNORMAL);
-                SetForegroundWindow(hwnd);
+            if (LOWORD(lp) == WM_RBUTTONUP) {
+                showTrayMenu();
+            } else if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK || LOWORD(lp) == NIN_BALLOONUSERCLICK) {
+                showMainWindow();
                 if (LOWORD(lp) == NIN_BALLOONUSERCLICK) showPage(PG_REPORTS);
             }
             return 0;
+        case WM_APP_SHOW: // otra instancia (o el inicio automático) pide mostrar la ventana
+            showMainWindow();
+            return 0;
+        case WM_APP_USB:
+            onVolumeArrived(static_cast<wchar_t>(wp));
+            return 0;
+        case WM_DEVICECHANGE:
+            // Se conectó una unidad (USB, tarjeta, disco externo): se encola para no bloquear el sistema con un diálogo
+            if (wp == DBT_DEVICEARRIVAL && lp != 0) {
+                const auto* hdr = reinterpret_cast<const DEV_BROADCAST_HDR*>(lp);
+                if (hdr->dbch_devicetype == DBT_DEVTYP_VOLUME) {
+                    const auto* vol = reinterpret_cast<const DEV_BROADCAST_VOLUME*>(lp);
+                    for (int i = 0; i < 26; ++i) {
+                        if (vol->dbcv_unitmask & (1u << i)) PostMessageW(hwnd, WM_APP_USB, static_cast<WPARAM>(L'A' + i), 0);
+                    }
+                }
+            }
+            return TRUE;
+        case WM_MOUSEWHEEL:
+            if (g.page == PG_SETTINGS && g.settingsMaxScroll > 0) {
+                g.settingsScroll -= (GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA) * S(60);
+                g.settingsScroll = std::clamp(g.settingsScroll, 0, g.settingsMaxScroll);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
         case WM_CLOSE:
+            // Segundo plano: cerrar la ventana solo la oculta; la protección y los avisos siguen en la bandeja
+            if (g.settings.closeToTray && !g.quitting) {
+                ShowWindow(hwnd, SW_HIDE);
+                if (!g.trayHintShown) {
+                    g.trayHintShown = true;
+                    showBalloon(L"OpenGuard sigue protegiendo", L"Se ejecuta en segundo plano. Haga clic en el icono de la bandeja para abrirlo.", NIIF_INFO);
+                }
+                return 0;
+            }
             if (g.scanning) {
                 std::lock_guard<std::mutex> lock(g.scannerMutex);
                 if (g.scanner) g.scanner->cancelScan();
@@ -1689,6 +2102,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     OleInitialize(nullptr);
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
+
+    // Instancia única: el servicio también usa este objeto para saber si la aplicación está abierta (preguntará ella
+    // al conectar una unidad). Si ya hay otra, se le pide que muestre su ventana y esta termina.
+    g.instanceMutex = CreateMutexW(nullptr, FALSE, L"Global\\OpenGuardGuiRunning");
+    if (g.instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (HWND other = FindWindowW(L"OpenGuardMainWindow", nullptr)) PostMessageW(other, WM_APP_SHOW, 0, 0);
+        return 0;
+    }
+    const bool startHidden = (wcsstr(GetCommandLineW(), L"--tray") != nullptr); // inicio automático: solo el icono
 
     g.hInst = hInstance;
     HDC screen = GetDC(nullptr);
@@ -1719,7 +2141,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"OpenGuard Antivirus", style, CW_USEDEFAULT, CW_USEDEFAULT,
                                 client.right - client.left, client.bottom - client.top, nullptr, nullptr, hInstance, nullptr);
     if (!hwnd) return 1;
-    ShowWindow(hwnd, nCmdShow);
+    ShowWindow(hwnd, startHidden ? SW_HIDE : nCmdShow);
     UpdateWindow(hwnd);
 
     MSG m;
@@ -1727,6 +2149,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    if (g.instanceMutex) CloseHandle(g.instanceMutex);
     OleUninitialize();
     return static_cast<int>(m.wParam);
 }

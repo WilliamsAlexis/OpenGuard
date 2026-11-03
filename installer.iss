@@ -57,6 +57,8 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [CustomMessages]
+spanish.TaskAutostart=Iniciar OpenGuard en segundo plano al iniciar sesion (icono en la bandeja, avisos y analisis de unidades USB)
+english.TaskAutostart=Start OpenGuard in the background at sign-in (tray icon, alerts and USB drive scanning)
 spanish.TaskAddToPath=Agregar OpenGuard al PATH del sistema (permite ejecutar "openguard_cli" desde cualquier terminal)
 english.TaskAddToPath=Add OpenGuard to the system PATH (lets you run "openguard_cli" from any terminal)
 spanish.IconQuickScan=Analisis rapido
@@ -77,6 +79,7 @@ english.AskRemoveData=Do you also want to delete the OpenGuard signature databas
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 ; Binarios principales (compilados con el runtime estatico: no requieren VC++ Redistributable)
@@ -120,6 +123,8 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""O
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""OpenGuard Worker (sin red)"" dir=in action=block program=""{app}\openguard_worker.exe"" enable=yes profile=any"; Flags: runhidden waituntilterminated
 ; 2) Registrar e iniciar la proteccion en tiempo real
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "--install"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StatusService}"
+; 2b) Inicio en segundo plano al iniciar sesion (tarea programada con privilegios elevados: sin pedir permiso cada vez)
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""OpenGuard Tray"" /TR ""\""{app}\openguard_gui.exe\"" --tray"" /SC ONLOGON /RL HIGHEST /F"; Flags: runhidden waituntilterminated; Tasks: autostart
 ; 3) Opcional: lanzar un analisis rapido al terminar
 Filename: "{cmd}"; Parameters: "/k """"{app}\{#MyAppExeName}"" quick"""; WorkingDir: "{app}";  Description: "{cm:RunQuickScan}"; Flags: postinstall nowait skipifsilent unchecked
 
@@ -127,6 +132,7 @@ Filename: "{cmd}"; Parameters: "/k """"{app}\{#MyAppExeName}"" quick"""; Working
 ; Detiene y remueve el servicio antes de eliminar los archivos
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOpenGuardService"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""OpenGuard Worker (sin red)"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveWorkerFirewallRule"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""OpenGuard Tray"" /F"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTrayTask"
 
 [Code]
 const
@@ -176,6 +182,8 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
+  { La aplicacion puede estar en segundo plano (bandeja): se cierra para poder reemplazar sus archivos }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM openguard_gui.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\net.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
