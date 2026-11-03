@@ -23,6 +23,7 @@ add_library(openguard_core STATIC
     settings.cpp
     history.cpp
     office_macros.cpp
+    drive_tools.cpp
 )
 
 target_include_directories(openguard_core PUBLIC

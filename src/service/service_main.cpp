@@ -175,7 +175,8 @@ public:
         m_history->purgeOlderThan(365); // mantenimiento: conserva un año de historial
         g_log.write("INFO", "Motor YARA: " + std::to_string(m_scanner->yaraRuleCount()) + " reglas cargadas");
 
-        const auto dirs = collectWatchDirectories();
+        const auto dirs = collectWatchDirectories(m_set.scanDownloads);
+        if (!m_set.scanDownloads) g_log.write("INFO", "Analisis de archivos descargados desactivado en la configuracion");
         if (m_enableDecoys) createDecoys(dirs);
         const bool started = m_monitor.start(dirs, [this](const fs::path& p) { onFileChanged(p); });
         g_log.write(started ? "INFO" : "ERROR",
@@ -211,7 +212,7 @@ public:
         }
         const std::set<wchar_t> current = currentRemovableDrives();
         for (wchar_t letter : current) {
-            if (m_knownRemovable.insert(letter).second && m_scanUsb) {
+            if (m_knownRemovable.insert(letter).second && shouldAutoScanUsb()) {
                 const fs::path root = std::wstring{letter, L':', L'\\'};
                 g_log.write("INFO", "Unidad extraible detectada: " + openguard::paths::toUtf8(root) + " - iniciando analisis");
                 m_usbThreads.emplace_back([this, root]() { scanRemovable(root); });
@@ -236,7 +237,7 @@ private:
     }
 
     /// Carpetas donde el malware suele aterrizar: perfiles de usuario y Temp del sistema.
-    static std::vector<fs::path> collectWatchDirectories() {
+    static std::vector<fs::path> collectWatchDirectories(bool includeDownloads) {
         std::vector<fs::path> dirs;
         std::error_code ec;
 
@@ -249,7 +250,9 @@ private:
             std::error_code e2;
             if (!it->is_directory(e2)) continue;
             const fs::path profile = it->path();
-            for (const wchar_t* sub : { L"Downloads", L"Desktop", L"Documents", L"AppData\\Local\\Temp" }) {
+            std::vector<const wchar_t*> subs = { L"Desktop", L"Documents", L"AppData\\Local\\Temp" };
+            if (includeDownloads) subs.insert(subs.begin(), L"Downloads"); // Configuración: "Analizar archivos descargados"
+            for (const wchar_t* sub : subs) {
                 const fs::path candidate = profile / sub;
                 if (fs::is_directory(candidate, e2)) dirs.push_back(candidate);
             }
@@ -276,6 +279,22 @@ private:
     static bool isInside(const fs::path& path, const fs::path& dir) {
         const fs::path rel = path.lexically_relative(dir);
         return !rel.empty() && *rel.begin() != "..";
+    }
+
+    /// true si la aplicación (GUI) está abierta: ella pregunta al usuario cuando se conecta una unidad.
+    static bool guiIsRunning() {
+        HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\OpenGuardGuiRunning");
+        if (!h) return false;
+        CloseHandle(h);
+        return true;
+    }
+
+    /// Modo "auto": el servicio analiza sin preguntar. Modo "ask": pregunta la GUI; si no está abierta, el servicio
+    /// analiza igualmente para que una unidad infectada nunca quede sin revisar.
+    bool shouldAutoScanUsb() const {
+        if (m_set.usbMode == "off") return false;
+        if (m_set.usbMode == "auto") return true;
+        return !guiIsRunning();
     }
 
     /// Ajustes editables desde la GUI (config.ini en la carpeta de datos de OpenGuard)
@@ -356,7 +375,7 @@ private:
         auto scanner = m_schedScanner;
         m_scheduleThread = std::thread([this, scanner, full]() {
             try {
-                const std::vector<fs::path> targets = full ? openguard::FileScanner::getFixedDrives() : collectWatchDirectories();
+                const std::vector<fs::path> targets = full ? openguard::FileScanner::getFixedDrives() : collectWatchDirectories(true);
                 auto session = scanner->scanPaths(targets, full ? openguard::ScanType::Full : openguard::ScanType::Quick);
                 for (const auto& r : session.results) {
                     if (r.isThreat()) handleResult(r);

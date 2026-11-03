@@ -15,6 +15,7 @@ add_executable(openguard_tests
     test_hardening.cpp
     test_isolation.cpp
     test_phase1.cpp
+    test_drive.cpp
 )
 
 target_compile_definitions(openguard_tests PRIVATE

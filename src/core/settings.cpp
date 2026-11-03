@@ -38,6 +38,16 @@ ProtectionSettings ProtectionSettings::load(const std::filesystem::path& iniPath
     s.autoQuarantine = GetPrivateProfileIntW(L"service", L"auto_quarantine", 1, f.c_str()) != 0;
     s.decoys = GetPrivateProfileIntW(L"service", L"decoys", 1, f.c_str()) != 0;
     s.scanUsb = GetPrivateProfileIntW(L"service", L"scan_usb", 1, f.c_str()) != 0;
+    {
+        // Compatibilidad: si no existe usb_mode se deriva de scan_usb (0 = off; cualquier otro caso = preguntar)
+        wchar_t mode[16]{};
+        GetPrivateProfileStringW(L"service", L"usb_mode", L"", mode, 16, f.c_str());
+        const std::wstring m(mode);
+        if (m == L"auto" || m == L"ask" || m == L"off") s.usbMode = std::string(m.begin(), m.end());
+        else s.usbMode = s.scanUsb ? "ask" : "off";
+        s.scanUsb = (s.usbMode != "off");
+    }
+    s.scanDownloads = GetPrivateProfileIntW(L"service", L"scan_downloads", 1, f.c_str()) != 0;
     s.isolatedScan = GetPrivateProfileIntW(L"service", L"isolated_scan", 1, f.c_str()) != 0;
     s.schedule.enabled = GetPrivateProfileIntW(L"schedule", L"enabled", 0, f.c_str()) != 0;
     {
@@ -85,7 +95,10 @@ bool ProtectionSettings::save(const std::filesystem::path& iniPath) const {
     };
     put(L"service", L"auto_quarantine", autoQuarantine ? L"1" : L"0");
     put(L"service", L"decoys", decoys ? L"1" : L"0");
-    put(L"service", L"scan_usb", scanUsb ? L"1" : L"0");
+    const std::string mode = (usbMode == "auto" || usbMode == "off") ? usbMode : "ask";
+    put(L"service", L"scan_usb", mode != "off" ? L"1" : L"0");
+    put(L"service", L"usb_mode", std::wstring(mode.begin(), mode.end()));
+    put(L"service", L"scan_downloads", scanDownloads ? L"1" : L"0");
     put(L"service", L"isolated_scan", isolatedScan ? L"1" : L"0");
     put(L"schedule", L"enabled", schedule.enabled ? L"1" : L"0");
     put(L"schedule", L"type", schedule.type == "full" ? L"full" : L"quick");

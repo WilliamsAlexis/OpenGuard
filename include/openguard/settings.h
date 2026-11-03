@@ -42,7 +42,11 @@ struct ScanSchedule {
 struct ProtectionSettings {
     bool autoQuarantine{true};     ///< Aislar automáticamente lo confirmado.
     bool decoys{true};             ///< Archivos señuelo anti-ransomware.
-    bool scanUsb{true};            ///< Analizar unidades USB al conectarlas.
+    bool scanUsb{true};            ///< Equivale a usbMode != "off" (se conserva por compatibilidad con versiones anteriores).
+    /// Unidades externas: "ask" = la aplicación pregunta si permite el análisis; "auto" = el servicio las analiza
+    /// sin preguntar; "off" = no se analizan. Si en modo "ask" la aplicación no está abierta, el servicio las analiza.
+    std::string usbMode{"ask"};
+    bool scanDownloads{true};      ///< Analizar automáticamente los archivos que se descargan (carpetas Descargas).
     bool isolatedScan{true};       ///< Analizar el contenido en un proceso aislado de bajo privilegio.
     ScanSchedule schedule;         ///< Análisis programado.
     int cpuPercent{50};            ///< Límite de CPU para análisis (10-100): fracción de núcleos usada.
