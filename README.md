@@ -42,8 +42,14 @@
 
 **Limitaciones conocidas**
 
-- **Análisis aislado**: el servicio analiza el contenido de los archivos en `openguard_worker.exe`, un proceso de bajo privilegio (token restringido sin privilegios, grupo Administradores deshabilitado, integridad baja, Job Object con límite de memoria y tiempo). Si el worker falla o se cuelga con un archivo, se reporta como `Heuristic.AnalyzerFailure`. No usa AppContainer, así que no bloquea el acceso a red del worker; si el token restringido no puede aplicarse, se degrada a Job Object y se avisa en el registro.
-- La GUI aún se ejecuta como Administrador (un canal local servicio↔GUI con autorización por cliente es trabajo pendiente).
+- **Análisis aislado** (servicio y análisis manuales de la GUI): el contenido de cada archivo se analiza en `openguard_worker.exe`, un proceso aparte que recibe el archivo como handle de solo lectura y se protege en capas:
+  - token restringido sin privilegios y con el grupo Administradores deshabilitado, e integridad **baja** (se aplica desde el servicio; además el propio worker se baja a integridad baja y se quita todos los privilegios al arrancar, así que también queda protegido si el servicio no pudo crear el token);
+  - mitigaciones del proceso: sin procesos hijos, sin código dinámico (JIT/shellcode) y sin imágenes remotas;
+  - Job Object con límite de memoria (1 GB), un único proceso, sin UI y tiempo máximo por archivo;
+  - **sin red**: el servicio (y el instalador) crean reglas del Firewall de Windows que bloquean todo el tráfico entrante y saliente del worker, de modo que un archivo que lograra explotarlo no puede exfiltrar datos ni descargar código. El estado se ve en Inicio > "Análisis aislado";
+  - la salida del worker se valida y acota: no puede fabricar una coincidencia de firma ni provocar un aislamiento automático.
+  Si el worker se cae o se cuelga con un archivo, se reporta como `Heuristic.AnalyzerFailure`. Si el worker no puede iniciarse, se usa el análisis en proceso como respaldo. No usa AppContainer: el aislamiento de red depende de la regla de firewall (que requiere administrador para crearse; si falla, el servicio lo registra como advertencia).
+- La GUI aún se ejecuta como Administrador. Para reducir el riesgo, sus análisis manuales usan también el worker aislado y no procesan archivos hostiles en su propio proceso elevado. Un canal local servicio↔GUI con autorización por cliente (para que la GUI no necesite elevación) sigue pendiente: ejecutaría operaciones como SYSTEM a petición de usuarios locales y exige un diseño de seguridad cuidadoso.
 - El motor YARA es un intérprete propio de un **subconjunto** de YARA (strings de texto/hex/regex, `N of`, `and/or/not`, `filesize`). Las reglas con módulos (`pe`, `uint16`, etc.) se descartan al cargar.
 - Opera en modo usuario (post-operación): no puede bloquear la ejecución previa como un minifilter de kernel.
 - La base de firmas incluida solo trae EICAR: use `update --online <url>` con una lista de hashes de su confianza (p. ej. un feed de abuse.ch MalwareBazaar con su `--auth-key`).

@@ -24,6 +24,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstring>
 #include <cstdint>
 #include <cwctype>
 #include <deque>
@@ -148,10 +149,24 @@ public:
                     return fallback->scanFile(p);
                 };
                 m_isolated = isolated;
-                g_log.write("INFO", "Analisis aislado activo (proceso trabajador de bajo privilegio)");
+
+                // El trabajador no debe tener red: si lo explotara un archivo malicioso no podría exfiltrar ni descargar
+                std::string fwDetail;
+                m_networkBlocked = openguard::IsolatedScanner::ensureNetworkBlock(opts.workerExe, fwDetail);
+                if (m_networkBlocked) {
+                    g_log.write("INFO", "Analisis aislado activo (bajo privilegio, sin acceso a red)");
+                } else {
+                    g_log.write("WARN", "Analisis aislado activo, pero NO se pudo bloquear la red del trabajador: " + fwDetail);
+                    hist("system", "WARN", {}, "Trabajador sin bloqueo de red", fwDetail);
+                }
+                writeIsolationStatus("full");
             } else {
                 g_log.write("WARN", "openguard_worker.exe no encontrado: el analisis se hace dentro del servicio");
+                hist("system", "WARN", {}, "Analisis aislado no disponible", "falta openguard_worker.exe");
+                writeIsolationStatus("missing");
             }
+        } else {
+            writeIsolationStatus("off");
         }
         m_config = cfg;
         m_scanner = std::make_unique<openguard::FileScanner>(m_db, cfg);
@@ -189,6 +204,7 @@ public:
             m_degradedLogged = true;
             g_log.write("WARN", "Analisis aislado en modo degradado: no se pudo aplicar el token restringido (solo Job Object)");
             hist("system", "WARN", {}, "Analisis aislado degradado", "sin token restringido");
+            writeIsolationStatus("degraded");
         }
         const std::set<wchar_t> current = currentRemovableDrives();
         for (wchar_t letter : current) {
@@ -288,6 +304,15 @@ private:
     openguard::ProtectionSettings m_set;
     std::shared_ptr<openguard::IsolatedScanner> m_isolated;
     bool m_degradedLogged{false};
+    bool m_networkBlocked{false};
+
+    /// Estado del aislamiento para la GUI: %ProgramData%\OpenGuard\status.ini
+    void writeIsolationStatus(const char* mode) {
+        const std::wstring ini = (openguard::paths::dataDir() / L"status.ini").wstring();
+        const std::wstring m(mode, mode + std::strlen(mode));
+        WritePrivateProfileStringW(L"isolation", L"mode", m.c_str(), ini.c_str());
+        WritePrivateProfileStringW(L"isolation", L"network_block", m_networkBlocked ? L"1" : L"0", ini.c_str());
+    }
     std::unique_ptr<openguard::ThreatHistory> m_history;
     bool m_autoQuarantine{true};
     bool m_enableDecoys{true};

@@ -114,6 +114,10 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 [Run]
 ; 1) Crear/actualizar la base de firmas (como Administrador, para que el servicio y el CLI la compartan)
 Filename: "{app}\{#MyAppExeName}"; Parameters: "update"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StatusDatabase}"
+; 1b) Bloquear la red del proceso de analisis aislado (el servicio tambien renueva estas reglas al iniciar)
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""OpenGuard Worker (sin red)"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""OpenGuard Worker (sin red)"" dir=out action=block program=""{app}\openguard_worker.exe"" enable=yes profile=any"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""OpenGuard Worker (sin red)"" dir=in action=block program=""{app}\openguard_worker.exe"" enable=yes profile=any"; Flags: runhidden waituntilterminated
 ; 2) Registrar e iniciar la proteccion en tiempo real
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "--install"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StatusService}"
 ; 3) Opcional: lanzar un analisis rapido al terminar
@@ -122,6 +126,7 @@ Filename: "{cmd}"; Parameters: "/k """"{app}\{#MyAppExeName}"" quick"""; Working
 [UninstallRun]
 ; Detiene y remueve el servicio antes de eliminar los archivos
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOpenGuardService"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""OpenGuard Worker (sin red)"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveWorkerFirewallRule"
 
 [Code]
 const

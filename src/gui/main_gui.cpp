@@ -12,6 +12,7 @@
 #include "openguard/signatures.h"
 #include "openguard/app_update.h"
 #include "openguard/history.h"
+#include "openguard/isolated_scan.h"
 #include "openguard/settings.h"
 #include "openguard/updater.h"
 #include "openguard/yara_lite.h"
@@ -136,6 +137,8 @@ struct AppState {
     Settings settings;
     openguard::ProtectionSettings prot;                  // configuración compartida con el servicio
     std::unique_ptr<openguard::ThreatHistory> history;   // historial estructurado
+    std::shared_ptr<openguard::IsolatedScanner> isolated;     // análisis aislado para los análisis manuales
+    std::shared_ptr<openguard::FileScanner> isolatedFallback; // respaldo en proceso si el trabajador no puede iniciarse
 } g;
 
 int S(int v) { return static_cast<int>(v * g.scale + 0.5); }
@@ -283,6 +286,29 @@ openguard::ScannerConfig makeConfig() {
     for (const auto& ex : g.prot.exclusions) cfg.excludedPaths.push_back(ex);
     cfg.threadCount = g.prot.threadCount();   // límite de CPU elegido por el usuario
     cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
+
+    // La GUI corre elevada: analizar archivos hostiles en su propio proceso sería peor que en el servicio.
+    // Los análisis manuales usan también el proceso trabajador aislado (con respaldo en proceso).
+    if (g.prot.isolatedScan) {
+        if (!g.isolated) {
+            openguard::IsolatedScanner::Options opts;
+            opts.workerExe = openguard::paths::executableDir() / "openguard_worker.exe";
+            g.isolated = std::make_shared<openguard::IsolatedScanner>(g.db, opts);
+        }
+        if (g.isolated->available()) {
+            if (!g.isolatedFallback) {
+                openguard::ScannerConfig fb = cfg;
+                fb.threadCount = 1;
+                g.isolatedFallback = std::make_shared<openguard::FileScanner>(g.db, fb);
+            }
+            auto iso = g.isolated;
+            auto fallback = g.isolatedFallback;
+            cfg.customAnalyzer = [iso, fallback](const fs::path& p) -> openguard::ScanResult {
+                if (auto r = iso->scan(p)) return *r;
+                return fallback->scanFile(p);
+            };
+        }
+    }
     return cfg;
 }
 
@@ -993,6 +1019,18 @@ void pageHeader(HDC hdc, int w, const std::wstring& title, const std::wstring& s
     text(hdc, subtitle, R(S(264), S(66), w - S(28), S(92)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+/// Estado del análisis aislado según lo que publica el servicio en status.ini.
+std::wstring isolationText() {
+    const fs::path ini = openguard::paths::dataDir() / L"status.ini";
+    const std::wstring mode = iniGetStr(ini, L"isolation", L"mode", L"");
+    const bool netBlock = iniGetBool(ini, L"isolation", L"network_block", false);
+    if (mode == L"full") return netBlock ? L"Activo: proceso de bajo privilegio y sin red" : L"Activo: bajo privilegio (red del worker NO bloqueada)";
+    if (mode == L"degraded") return L"Degradado: sin token restringido (limitado por Job Object y mitigaciones)";
+    if (mode == L"missing") return L"No disponible: falta openguard_worker.exe";
+    if (mode == L"off") return L"Desactivado en la configuracion";
+    return L"Sin datos (inicie la proteccion en tiempo real)";
+}
+
 void paintHome(HDC hdc, int w, int h) {
     pageHeader(hdc, w, L"Inicio", L"Estado general de la proteccion de su equipo");
     const RECT body = bodyRect(w, h);
@@ -1045,6 +1083,7 @@ void paintHome(HDC hdc, int w, int h) {
     const wchar_t* svcText = g.svc == Svc::Running ? L"Activa" : g.svc == Svc::NotInstalled ? L"No instalada" : g.svc == Svc::Pending ? L"Cambiando de estado" : L"Desactivada";
     const std::pair<std::wstring, std::wstring> rows[] = {
         {L"Proteccion en tiempo real", svcText},
+        {L"Analisis aislado", isolationText()},
         {L"Ultimo analisis", lastScan + (lastThreats == L"-" ? L"" : L"  (" + lastThreats + L" amenazas)")},
         {L"Ultima actualizacion de firmas", lastUpdate},
         {L"Motor", W(std::string("OpenGuard ") + OPENGUARD_VERSION) + L"  |  Firmas + YARA + Heuristica PE/Scripts"},

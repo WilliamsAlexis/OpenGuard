@@ -39,6 +39,14 @@ public:
 
     IsolatedScanner(std::shared_ptr<SignatureDB> db, Options options);
 
+    /**
+     * @brief Crea reglas del Firewall de Windows que bloquean TODO el tráfico (entrante y saliente) del
+     *        ejecutable trabajador. Un trabajador comprometido por un archivo malicioso no podría exfiltrar
+     *        datos ni descargar código. Requiere privilegios de administrador (el servicio los tiene).
+     * @param[out] detail Descripción del fallo si devuelve false.
+     */
+    static bool ensureNetworkBlock(const std::filesystem::path& workerExe, std::string& detail);
+
     /// El ejecutable del trabajador existe y puede usarse.
     [[nodiscard]] bool available() const;
 

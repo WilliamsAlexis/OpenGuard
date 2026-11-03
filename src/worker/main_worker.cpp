@@ -12,6 +12,7 @@
 #include "openguard/yara_lite.h"
 
 #include <windows.h>
+#include <sddl.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -35,6 +36,51 @@ bool writeAll(HANDLE out, const std::string& s) {
     return true;
 }
 
+/// Reduce los privilegios del propio proceso ANTES de tocar datos no confiables. Funciona aunque el servicio
+/// no haya podido crear un token restringido (modo degradado, p. ej. cuando lo lanza una GUI elevada):
+///  - integridad BAJA (no puede escribir en objetos de nivel medio/alto),
+///  - todos los privilegios eliminados de forma permanente,
+///  - sin creación de procesos hijos, sin código dinámico (JIT/shellcode) y sin imágenes remotas.
+/// Los fallos se ignoran a propósito: son capas adicionales y el Job Object del llamador sigue aplicando.
+void selfSandbox() {
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        PSID lowSid = nullptr;
+        if (ConvertStringSidToSidW(L"S-1-16-4096", &lowSid)) {
+            TOKEN_MANDATORY_LABEL tml{};
+            tml.Label.Attributes = SE_GROUP_INTEGRITY;
+            tml.Label.Sid = lowSid;
+            SetTokenInformation(token, TokenIntegrityLevel, &tml, static_cast<DWORD>(sizeof(tml)) + GetLengthSid(lowSid));
+            LocalFree(lowSid);
+        }
+
+        DWORD len = 0;
+        GetTokenInformation(token, TokenPrivileges, nullptr, 0, &len);
+        if (len > 0) {
+            std::vector<BYTE> buf(len);
+            if (GetTokenInformation(token, TokenPrivileges, buf.data(), len, &len)) {
+                auto* tp = reinterpret_cast<TOKEN_PRIVILEGES*>(buf.data());
+                for (DWORD i = 0; i < tp->PrivilegeCount; ++i) tp->Privileges[i].Attributes = SE_PRIVILEGE_REMOVED;
+                AdjustTokenPrivileges(token, FALSE, tp, 0, nullptr, nullptr);
+            }
+        }
+        CloseHandle(token);
+    }
+
+    PROCESS_MITIGATION_CHILD_PROCESS_POLICY child{};
+    child.NoChildProcessCreation = 1;
+    SetProcessMitigationPolicy(ProcessChildProcessPolicy, &child, sizeof(child));
+
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dyn{};
+    dyn.ProhibitDynamicCode = 1;
+    SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dyn, sizeof(dyn));
+
+    PROCESS_MITIGATION_IMAGE_LOAD_POLICY img{};
+    img.NoRemoteImages = 1;
+    img.NoLowMandatoryLabelImages = 1;
+    SetProcessMitigationPolicy(ProcessImageLoadPolicy, &img, sizeof(img));
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -51,6 +97,8 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
     if (!hFile || hFile == INVALID_HANDLE_VALUE) return 2;
+
+    selfSandbox(); // a partir de aquí el proceso ya no puede escribir fuera de la tubería heredada
 
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     if (!out || out == INVALID_HANDLE_VALUE) return 2;

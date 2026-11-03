@@ -220,7 +220,46 @@ RunStatus runWorker(const IsolatedScanner::Options& opt, HANDLE hFile, const std
     return RunStatus::Ok;
 }
 
+/// Ejecuta una orden oculta y espera su fin. @return código de salida, o -1 si no pudo lanzarse.
+long runHiddenCommand(std::wstring cmd, DWORD timeoutMs) {
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return -1;
+    Handle process(pi.hProcess), thread(pi.hThread);
+    if (WaitForSingleObject(process.get(), timeoutMs) != WAIT_OBJECT_0) {
+        TerminateProcess(process.get(), 1);
+        return -1;
+    }
+    DWORD code = 1;
+    GetExitCodeProcess(process.get(), &code);
+    return static_cast<long>(code);
+}
+
 } // namespace
+
+bool IsolatedScanner::ensureNetworkBlock(const std::filesystem::path& workerExe, std::string& detail) {
+    detail.clear();
+    wchar_t sysDir[MAX_PATH]{};
+    if (!GetSystemDirectoryW(sysDir, MAX_PATH)) { detail = "GetSystemDirectory"; return false; }
+    const std::wstring netsh = L"\"" + std::wstring(sysDir) + L"\\netsh.exe\" advfirewall firewall ";
+    const std::wstring name = L"name=\"OpenGuard Worker (sin red)\"";
+
+    // Se recrean siempre: así la regla apunta a la ruta actual de instalación
+    runHiddenCommand(netsh + L"delete rule " + name, 15000);
+
+    const std::wstring program = L"program=\"" + workerExe.wstring() + L"\"";
+    const long outRc = runHiddenCommand(netsh + L"add rule " + name + L" dir=out action=block " + program + L" enable=yes profile=any", 15000);
+    const long inRc = runHiddenCommand(netsh + L"add rule " + name + L" dir=in action=block " + program + L" enable=yes profile=any", 15000);
+
+    if (outRc != 0 || inRc != 0) {
+        detail = "netsh devolvio " + std::to_string(outRc) + "/" + std::to_string(inRc) + " (se requieren privilegios de administrador)";
+        return false;
+    }
+    return true;
+}
 
 IsolatedScanner::IsolatedScanner(std::shared_ptr<SignatureDB> db, Options options)
     : m_db(std::move(db)), m_options(std::move(options)) {}
