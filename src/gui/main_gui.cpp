@@ -10,6 +10,7 @@
 #include "openguard/quarantine.h"
 #include "openguard/scanner.h"
 #include "openguard/signatures.h"
+#include "openguard/app_update.h"
 #include "openguard/updater.h"
 #include "openguard/yara_lite.h"
 
@@ -74,15 +75,19 @@ enum : int {
     ID_SCAN_QUICK = 200, ID_SCAN_FULL, ID_SCAN_FOLDER, ID_CANCEL, ID_ISOLATE,
     ID_UPDATE_NOW, ID_IMPORT_FILE, ID_Q_RESTORE, ID_Q_DELETE, ID_Q_REFRESH,
     ID_LOG_OPEN, ID_LOG_REFRESH, ID_TOGGLE_PROTECTION, ID_SAVE_SETTINGS, ID_FIX,
-    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY
+    ID_APP_CHECK, ID_APP_INSTALL, ID_APP_PAGE,
+    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD
 };
 
 constexpr UINT WM_APP_PROGRESS = WM_APP + 1;
 constexpr UINT WM_APP_DONE = WM_APP + 2;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 4;
+constexpr UINT WM_APP_APPCHECK_DONE = WM_APP + 5;
+constexpr UINT WM_APP_APPDL_DONE = WM_APP + 6;
 constexpr UINT_PTR TIMER_REFRESH = 1;
 constexpr UINT_PTR TIMER_LOGPOLL = 2;
+constexpr UINT_PTR TIMER_APPCHECK = 3;
 constexpr int IDC_LIST = 1001;
 constexpr int IDC_PROGRESS = 1002;
 
@@ -90,7 +95,9 @@ enum class Svc { NotInstalled, Stopped, Running, Pending };
 
 struct HitBox { RECT r; int id; };
 
-struct Settings { bool autoQuarantine{true}, decoys{true}, scanUsb{true}, notify{true}; };
+struct Settings { bool autoQuarantine{true}, decoys{true}, scanUsb{true}, notify{true}, checkAppUpdates{true}; };
+
+struct DownloadResult { bool ok{false}; std::wstring path; std::wstring error; };
 
 struct AppState {
     HWND main{}, list{}, progress{};
@@ -102,9 +109,13 @@ struct AppState {
     std::shared_ptr<openguard::SignatureDB> db;
     std::shared_ptr<openguard::FileScanner> scanner;
     std::mutex scannerMutex;
-    std::thread worker, updater;
+    std::thread worker, updater, appThread;
     std::atomic<bool> scanning{false};
     std::atomic<bool> updating{false};
+    std::atomic<bool> appBusy{false};
+    openguard::AppUpdateInfo appInfo;
+    bool appChecked{false}, appSilentCheck{false};
+    std::wstring appMsg;
     std::atomic<size_t> processed{0};
 
     Page page{PG_HOME};
@@ -163,6 +174,7 @@ void loadSettings() {
     g.settings.decoys = iniGetBool(serviceIni(), L"service", L"decoys", true);
     g.settings.scanUsb = iniGetBool(serviceIni(), L"service", L"scan_usb", true);
     g.settings.notify = iniGetBool(guiIni(), L"gui", L"notifications", true);
+    g.settings.checkAppUpdates = iniGetBool(guiIni(), L"gui", L"check_app_updates", true);
 }
 
 bool saveSettings() {
@@ -171,6 +183,7 @@ bool saveSettings() {
     const BOOL b = WritePrivateProfileStringW(L"service", L"decoys", g.settings.decoys ? L"1" : L"0", ini.c_str());
     const BOOL c = WritePrivateProfileStringW(L"service", L"scan_usb", g.settings.scanUsb ? L"1" : L"0", ini.c_str());
     iniSetStr(guiIni(), L"gui", L"notifications", g.settings.notify ? L"1" : L"0");
+    iniSetStr(guiIni(), L"gui", L"check_app_updates", g.settings.checkAppUpdates ? L"1" : L"0");
     return a && b && c;
 }
 
@@ -694,6 +707,98 @@ void importFromFile() {
     InvalidateRect(g.main, nullptr, FALSE);
 }
 
+// ----------------------------------------------------------------------------- actualización del programa
+
+void showBalloon(const std::wstring& title, const std::wstring& body, DWORD icon);
+
+void startAppCheck(bool silent) {
+    if (g.appBusy.exchange(true)) return;
+    if (g.appThread.joinable()) g.appThread.join();
+    g.appSilentCheck = silent;
+    if (!silent) { g.appMsg = L"Buscando actualizaciones..."; InvalidateRect(g.main, nullptr, FALSE); }
+
+    g.appThread = std::thread([]() {
+        auto* info = new openguard::AppUpdateInfo();
+        try {
+            *info = openguard::checkForAppUpdate(OPENGUARD_VERSION);
+        } catch (const std::exception& e) {
+            info->error = e.what();
+        }
+        PostMessageW(g.main, WM_APP_APPCHECK_DONE, 0, reinterpret_cast<LPARAM>(info));
+    });
+}
+
+void onAppCheckDone(openguard::AppUpdateInfo* info) {
+    std::unique_ptr<openguard::AppUpdateInfo> owned(info);
+    if (g.appThread.joinable()) g.appThread.join();
+    g.appBusy = false;
+
+    const bool wasNew = g.appInfo.available;
+    g.appInfo = *owned;
+    g.appChecked = owned->ok;
+    iniSetStr(guiIni(), L"stats", L"last_app_check", nowText());
+
+    if (!owned->ok) {
+        g.appMsg = g.appSilentCheck ? L"" : L"No se pudo buscar actualizaciones: " + W(owned->error);
+    } else if (owned->available) {
+        g.appMsg = L"Hay una nueva version disponible: " + W(owned->latestVersion);
+        if (!wasNew && g.settings.notify) {
+            showBalloon(L"OpenGuard: nueva version " + W(owned->latestVersion),
+                        L"Abra OpenGuard > Actualizacion para descargarla e instalarla.", NIIF_INFO);
+        }
+    } else {
+        g.appMsg = g.appSilentCheck ? L"" : L"Tiene la version mas reciente (" + W(std::string(OPENGUARD_VERSION)) + L").";
+    }
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
+void startAppInstall() {
+    if (!g.appInfo.available || g.appBusy.exchange(true)) return;
+    if (g.appThread.joinable()) g.appThread.join();
+    g.appMsg = L"Descargando instalador (puede tardar unos segundos)...";
+    InvalidateRect(g.main, nullptr, FALSE);
+
+    const openguard::AppUpdateInfo info = g.appInfo;
+    g.appThread = std::thread([info]() {
+        auto* res = new DownloadResult();
+        try {
+            wchar_t tmp[MAX_PATH]{};
+            GetTempPathW(MAX_PATH, tmp);
+            const fs::path dest = fs::path(tmp) / fs::path(W(info.installerName.empty() ? std::string("OpenGuard_Setup.exe") : info.installerName));
+            std::string err;
+            res->ok = openguard::downloadInstaller(info, dest, err);
+            res->path = dest.wstring();
+            res->error = W(err);
+        } catch (const std::exception& e) {
+            res->error = W(e.what());
+        }
+        PostMessageW(g.main, WM_APP_APPDL_DONE, 0, reinterpret_cast<LPARAM>(res));
+    });
+}
+
+void onAppDownloadDone(DownloadResult* res) {
+    std::unique_ptr<DownloadResult> owned(res);
+    if (g.appThread.joinable()) g.appThread.join();
+    g.appBusy = false;
+
+    if (!owned->ok) {
+        g.appMsg = L"No se pudo descargar la actualizacion: " + owned->error;
+        InvalidateRect(g.main, nullptr, FALSE);
+        return;
+    }
+    g.appMsg = L"Instalador descargado y verificado.";
+    if (MessageBoxW(g.main, L"El instalador se descargo y su integridad fue verificada.\n\nOpenGuard se cerrara para actualizarse. Continuar?",
+                    L"Actualizar OpenGuard", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        if (reinterpret_cast<INT_PTR>(ShellExecuteW(g.main, L"open", owned->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32) {
+            PostMessageW(g.main, WM_CLOSE, 0, 0);
+        } else {
+            MessageBoxW(g.main, (L"No se pudo iniciar el instalador. Puede ejecutarlo manualmente desde:\n" + owned->path).c_str(),
+                        L"OpenGuard", MB_OK | MB_ICONWARNING);
+        }
+    }
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
 // ----------------------------------------------------------------------------- bandeja y notificaciones
 
 std::uintmax_t g_logOffset = 0;
@@ -847,10 +952,21 @@ void paintHome(HDC hdc, int w, int h) {
                    st.action, st.actionId, BS_ONBANNER, true, st.color);
     }
 
+    // Aviso de nueva versión del programa
+    int extra = 0;
+    if (g.appInfo.available) {
+        RECT strip = R(body.left, banner.bottom + S(12), body.right, banner.bottom + S(12) + S(46));
+        roundRect(hdc, strip, S(10), RGB(228, 240, 252), RGB(150, 190, 230), true);
+        text(hdc, L"Nueva version disponible: OpenGuard " + W(g.appInfo.latestVersion),
+             R(strip.left + S(18), strip.top, strip.right - S(200), strip.bottom), g.fBold, RGB(20, 70, 130), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        drawButton(hdc, R(strip.right - S(180), strip.top + S(7), strip.right - S(10), strip.bottom - S(7)), L"Ver actualizacion", NAV_BASE + PG_UPDATE, BS_PRIMARY);
+        extra = S(58);
+    }
+
     // Tarjetas de acciones
     const int gap = S(16);
     const int cw = (bw - 3 * gap) / 4;
-    const int ctop = banner.bottom + S(22);
+    const int ctop = banner.bottom + S(22) + extra;
     const int ch = S(124);
     drawCardButton(hdc, R(body.left, ctop, body.left + cw, ctop + ch), L"Analisis rapido",
                    L"Descargas, Escritorio, Documentos y Temp", ID_SCAN_QUICK, !g.scanning);
@@ -863,6 +979,7 @@ void paintHome(HDC hdc, int w, int h) {
 
     // Resumen
     RECT info = R(body.left, ctop + ch + S(22), body.right, std::min<int>(body.bottom, ctop + ch + S(22) + S(150)));
+    if (info.bottom - info.top < S(60)) return; // ventana muy baja: se omite el resumen
     drawCard(hdc, info);
     const std::wstring lastScan = iniGetStr(guiIni(), L"stats", L"last_scan", L"Nunca");
     const std::wstring lastThreats = iniGetStr(guiIni(), L"stats", L"last_threats", L"-");
@@ -875,7 +992,10 @@ void paintHome(HDC hdc, int w, int h) {
         {L"Motor", W(std::string("OpenGuard ") + OPENGUARD_VERSION) + L"  |  Firmas + YARA + Heuristica PE/Scripts"},
     };
     int ry = info.top + S(16);
+    const int maxRows = std::max(1, (info.bottom - info.top - S(20)) / S(30));
+    int shown = 0;
     for (const auto& row : rows) {
+        if (shown++ >= maxRows) break;
         text(hdc, row.first, R(info.left + S(20), ry, info.left + S(300), ry + S(26)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         text(hdc, row.second, R(info.left + S(310), ry, info.right - S(20), ry + S(26)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         ry += S(30);
@@ -901,28 +1021,60 @@ void paintScan(HDC hdc, int w, int h) {
 }
 
 void paintUpdate(HDC hdc, int w, int h) {
-    pageHeader(hdc, w, L"Actualizacion", L"Mantenga al dia la base de firmas de amenazas");
+    pageHeader(hdc, w, L"Actualizacion", L"Mantenga al dia las firmas de amenazas y el programa");
     const RECT body = bodyRect(w, h);
 
-    RECT card = R(body.left, body.top, body.right, body.top + S(210));
+    // --- Tarjeta 1: base de firmas
+    RECT card = R(body.left, body.top, body.right, body.top + S(176));
     drawCard(hdc, card);
-    text(hdc, std::to_wstring(g.sigCount), R(card.left + S(24), card.top + S(16), card.left + S(300), card.top + S(70)), g.fBig, C_ACCENT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    text(hdc, L"firmas cargadas", R(card.left + S(24), card.top + S(68), card.left + S(300), card.top + S(92)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    text(hdc, L"Reglas YARA: " + std::to_wstring(g.yaraCount), R(card.left + S(320), card.top + S(26), card.right - S(20), card.top + S(52)), g.fBody, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, std::to_wstring(g.sigCount), R(card.left + S(24), card.top + S(12), card.left + S(300), card.top + S(62)), g.fBig, C_ACCENT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"firmas cargadas", R(card.left + S(24), card.top + S(60), card.left + S(300), card.top + S(84)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"Reglas YARA: " + std::to_wstring(g.yaraCount), R(card.left + S(320), card.top + S(22), card.right - S(20), card.top + S(48)), g.fBody, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     text(hdc, L"Ultima actualizacion: " + iniGetStr(guiIni(), L"stats", L"last_update", L"Nunca"),
-         R(card.left + S(320), card.top + S(56), card.right - S(20), card.top + S(82)), g.fBody, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-
-    drawButton(hdc, R(card.left + S(24), card.bottom - S(60), card.left + S(24) + S(190), card.bottom - S(20)),
-               g.updating ? L"Actualizando..." : L"Actualizar ahora", ID_UPDATE_NOW, BS_PRIMARY, !g.updating);
-    drawButton(hdc, R(card.left + S(228), card.bottom - S(60), card.left + S(228) + S(210), card.bottom - S(20)),
+         R(card.left + S(320), card.top + S(52), card.right - S(20), card.top + S(78)), g.fBody, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    drawButton(hdc, R(card.left + S(24), card.bottom - S(56), card.left + S(24) + S(190), card.bottom - S(16)),
+               g.updating ? L"Actualizando..." : L"Actualizar firmas", ID_UPDATE_NOW, BS_PRIMARY, !g.updating);
+    drawButton(hdc, R(card.left + S(228), card.bottom - S(56), card.left + S(228) + S(210), card.bottom - S(16)),
                L"Importar desde archivo...", ID_IMPORT_FILE, BS_SECONDARY, !g.updating);
-
     if (!g.updateMsg.empty()) {
-        text(hdc, g.updateMsg, R(body.left, card.bottom + S(16), body.right, card.bottom + S(70)), g.fBold, g.updateOk ? C_OK : C_BAD);
+        text(hdc, g.updateMsg, R(body.left, card.bottom + S(8), body.right, card.bottom + S(32)), g.fBold, g.updateOk ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     }
-    text(hdc, L"La actualizacion descarga la lista de firmas por HTTPS desde el repositorio oficial. Solo se envia una peticion GET; "
-              L"no se transmite informacion de su equipo ni de sus archivos.",
-         R(body.left, card.bottom + S(76), body.right, card.bottom + S(130)), g.fSmall, C_MUTED);
+
+    // --- Tarjeta 2: version del programa
+    RECT app = R(body.left, card.bottom + S(42), body.right, card.bottom + S(42) + S(190));
+    if (app.bottom > body.bottom + S(10)) app.bottom = body.bottom + S(10);
+    drawCard(hdc, app);
+    text(hdc, L"Version del programa", R(app.left + S(24), app.top + S(14), app.right - S(20), app.top + S(40)), g.fH2, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, W(std::string("Instalada: ") + OPENGUARD_VERSION), R(app.left + S(24), app.top + S(44), app.left + S(300), app.top + S(70)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+
+    std::wstring status;
+    COLORREF statusColor = C_MUTED;
+    if (g.appInfo.available) {
+        status = L"Nueva version disponible: " + W(g.appInfo.latestVersion);
+        statusColor = RGB(20, 110, 190);
+    } else if (!g.appMsg.empty()) {
+        status = g.appMsg;
+        statusColor = g.appChecked ? C_OK : C_MUTED;
+    } else {
+        status = L"Pulse \"Buscar actualizaciones\" para comprobar si hay una version mas reciente.";
+    }
+    if (g.appInfo.available && !g.appMsg.empty() && g.appMsg.rfind(L"Hay una nueva", 0) != 0) status += L"\n" + g.appMsg;
+    text(hdc, status, R(app.left + S(320), app.top + S(14), app.right - S(20), app.top + S(100)), g.fBold, statusColor);
+
+    const int by = app.bottom - S(56);
+    int bx = app.left + S(24);
+    drawButton(hdc, R(bx, by, bx + S(210), by + S(40)), g.appBusy ? L"Espere..." : L"Buscar actualizaciones", ID_APP_CHECK, BS_SECONDARY, !g.appBusy);
+    bx += S(222);
+    if (g.appInfo.available) {
+        drawButton(hdc, R(bx, by, bx + S(270), by + S(40)), L"Descargar e instalar " + W(g.appInfo.latestVersion), ID_APP_INSTALL, BS_PRIMARY,
+                   !g.appBusy && !g.appInfo.installerUrl.empty());
+        bx += S(282);
+        if (!g.appInfo.pageUrl.empty()) drawButton(hdc, R(bx, by, bx + S(170), by + S(40)), L"Ver novedades", ID_APP_PAGE, BS_SECONDARY);
+    }
+
+    text(hdc, L"Las comprobaciones solo envian peticiones GET por HTTPS a GitHub; no se transmite informacion de su equipo. "
+              L"El instalador descargado se verifica con su hash SHA-256 antes de ejecutarse.",
+         R(body.left, app.bottom + S(10), body.right, body.bottom + S(30)), g.fSmall, C_MUTED);
 }
 
 void paintQuarantine(HDC hdc, int w, int h) {
@@ -952,9 +1104,10 @@ void paintSettings(HDC hdc, int w, int h) {
         {L"Archivos senuelo anti-ransomware", L"Crea archivos ocultos en Documentos y Escritorio y alerta si alguien los modifica.", &g.settings.decoys, TOG_DECOY},
         {L"Analizar unidades USB al conectarlas", L"Revisa automaticamente las memorias y discos extraibles nuevos.", &g.settings.scanUsb, TOG_USB},
         {L"Mostrar notificaciones en la bandeja", L"Avisa cuando el servicio detecta o aisla una amenaza.", &g.settings.notify, TOG_NOTIFY},
+        {L"Buscar actualizaciones del programa automaticamente", L"Comprueba en GitHub si hay una version nueva de OpenGuard al abrir la aplicacion.", &g.settings.checkAppUpdates, TOG_APPUPD},
     };
-    const int rowH = S(70);
-    RECT card = R(body.left, body.top, body.right, body.top + rowH * 4 + S(8));
+    const int rowH = S(64);
+    RECT card = R(body.left, body.top, body.right, body.top + rowH * 5 + S(8));
     drawCard(hdc, card);
     int y = card.top + S(4);
     for (const auto& r : rows) {
@@ -962,11 +1115,11 @@ void paintSettings(HDC hdc, int w, int h) {
         text(hdc, r.desc, R(card.left + S(22), y + S(34), card.right - S(100), y + rowH - S(4)), g.fSmall, C_MUTED);
         drawToggle(hdc, card.right - S(76), y + (rowH - S(24)) / 2, *r.value, r.id);
         y += rowH;
-        if (&r != &rows[3]) fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
+        if (&r != &rows[4]) fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
     }
 
-    const int py = card.bottom + S(18);
-    RECT pc = R(body.left, py, body.right, py + S(76));
+    const int py = card.bottom + S(14);
+    RECT pc = R(body.left, py, body.right, py + S(72));
     drawCard(hdc, pc);
     const bool running = (g.svc == Svc::Running);
     text(hdc, L"Proteccion en tiempo real", R(pc.left + S(22), pc.top + S(12), pc.right - S(260), pc.top + S(36)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
@@ -1038,6 +1191,12 @@ void onHit(int id) {
         case TOG_DECOY: g.settings.decoys = !g.settings.decoys; break;
         case TOG_USB: g.settings.scanUsb = !g.settings.scanUsb; break;
         case TOG_NOTIFY: g.settings.notify = !g.settings.notify; break;
+        case TOG_APPUPD: g.settings.checkAppUpdates = !g.settings.checkAppUpdates; break;
+        case ID_APP_CHECK: startAppCheck(false); break;
+        case ID_APP_INSTALL: startAppInstall(); break;
+        case ID_APP_PAGE:
+            if (g.appInfo.pageUrl.rfind("https://", 0) == 0) ShellExecuteW(g.main, L"open", W(g.appInfo.pageUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
         case ID_SAVE_SETTINGS:
             if (!saveSettings()) {
                 MessageBoxW(g.main, L"No se pudo guardar la configuracion del servicio.", L"OpenGuard", MB_OK | MB_ICONWARNING);
@@ -1097,6 +1256,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             addTrayIcon();
             SetTimer(hwnd, TIMER_REFRESH, 5000, nullptr);
             SetTimer(hwnd, TIMER_LOGPOLL, 5000, nullptr);
+            SetTimer(hwnd, TIMER_APPCHECK, 6 * 60 * 60 * 1000, nullptr); // revisa nuevas versiones cada 6 horas
+            if (g.settings.checkAppUpdates) startAppCheck(true);
             return 0;
         }
         case WM_SIZE:
@@ -1152,6 +1313,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER:
             if (wp == TIMER_LOGPOLL) { pollServiceLog(); return 0; }
+            if (wp == TIMER_APPCHECK) { if (g.settings.checkAppUpdates) startAppCheck(true); return 0; }
             if (wp == TIMER_REFRESH && !g.scanning) { refreshData(); InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
         case WM_APP_PROGRESS:
@@ -1160,6 +1322,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_DONE:
             onScanDone(reinterpret_cast<openguard::ScanSessionStats*>(lp));
+            return 0;
+        case WM_APP_APPCHECK_DONE:
+            onAppCheckDone(reinterpret_cast<openguard::AppUpdateInfo*>(lp));
+            return 0;
+        case WM_APP_APPDL_DONE:
+            onAppDownloadDone(reinterpret_cast<DownloadResult*>(lp));
             return 0;
         case WM_APP_UPDATE_DONE:
             onUpdateDone(reinterpret_cast<openguard::UpdateResult*>(lp));
@@ -1182,6 +1350,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             removeTrayIcon();
             if (g.worker.joinable()) g.worker.join();
             if (g.updater.joinable()) g.updater.join();
+            if (g.appThread.joinable()) g.appThread.join();
             PostQuitMessage(0);
             return 0;
         default:

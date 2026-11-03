@@ -11,6 +11,7 @@ add_executable(openguard_tests
     test_realtime_pe.cpp
     test_yara.cpp
     test_update.cpp
+    test_app_update.cpp
 )
 
 target_compile_definitions(openguard_tests PRIVATE

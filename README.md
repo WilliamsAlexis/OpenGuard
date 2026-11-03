@@ -36,7 +36,7 @@
 | **Protección en tiempo real** | `ReadDirectoryChangesW` | Servicio de Windows que vigila Descargas, Escritorio, Documentos y Temp, analiza cada archivo nuevo/modificado y escanea USB al conectarse. |
 | **Anti-ransomware** | Archivos señuelo + ráfagas | El servicio crea archivos señuelo ocultos en Documentos y Escritorio y alerta si se modifican, eliminan o renombran; también alerta ante >=150 archivos modificados en 10 s. Solo alerta (en modo usuario no puede identificar ni detener el proceso). |
 | **Reglas YARA** | Intérprete `yara_lite` | Evalúa `signatures/yara_rules/*.yar` (primeros 4 MB de cada archivo) y reporta detecciones `YARA.<regla>`. |
-| **Interfaz gráfica** | Win32 nativo | `openguard_gui.exe`: panel tipo suite comercial con Inicio (estado de protección), Análisis, Actualización, Cuarentena, Informes y Configuración; avisos en la bandeja del sistema. Se ejecuta como Administrador. |
+| **Interfaz gráfica** | Win32 nativo | `openguard_gui.exe`: panel tipo suite comercial con Inicio (estado de protección), Análisis, Actualización, Cuarentena, Informes y Configuración; avisos en la bandeja del sistema. Se ejecuta como Administrador. Avisa cuando hay una nueva versión publicada en GitHub (Releases) y permite descargarla e instalarla con verificación SHA-256. |
 | **Auditoría de vulnerabilidades** | Registro + NetAPI | SMBv1, UAC, Firewall, Defender deshabilitado por política, RDP y cuenta Guest. |
 | **Auditoría de red** | IP Helper API | Conexiones TCP con PID/proceso, puertos C2 conocidos, secuestro del archivo `hosts` y proxy local. |
 

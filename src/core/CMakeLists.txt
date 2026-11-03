@@ -17,6 +17,7 @@ add_library(openguard_core STATIC
     yara_lite.cpp
     net_update.cpp
     updater.cpp
+    app_update.cpp
 )
 
 target_include_directories(openguard_core PUBLIC
