@@ -28,6 +28,7 @@
 #include <shlobj.h>
 
 #include <atomic>
+#include <cmath>
 #include <ctime>
 #include <algorithm>
 #include <cwctype>
@@ -42,6 +43,12 @@
 #include <thread>
 #include <vector>
 
+// GDI+: bordes suaves, degradados, transparencias y brillos. Con NOMINMAX, sus cabeceras necesitan min/max de std.
+using std::min;
+using std::max;
+#include <gdiplus.h>
+#include <uxtheme.h>
+
 #ifndef OPENGUARD_VERSION
 #define OPENGUARD_VERSION "0.2.0"
 #endif
@@ -51,6 +58,8 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 namespace {
 
@@ -58,20 +67,23 @@ namespace fs = std::filesystem;
 
 // ----------------------------------------------------------------------------- paleta
 
-constexpr COLORREF C_SIDE = RGB(13, 33, 55);
-constexpr COLORREF C_SIDE_HOT = RGB(24, 52, 82);
-constexpr COLORREF C_ACCENT = RGB(0, 168, 142);
-constexpr COLORREF C_ACCENT_HOT = RGB(0, 140, 118);
-constexpr COLORREF C_BG = RGB(243, 246, 249);
-constexpr COLORREF C_CARD = RGB(255, 255, 255);
-constexpr COLORREF C_BORDER = RGB(221, 228, 235);
-constexpr COLORREF C_TEXT = RGB(27, 42, 58);
-constexpr COLORREF C_MUTED = RGB(105, 120, 135);
-constexpr COLORREF C_OK = RGB(31, 163, 99);
-constexpr COLORREF C_WARN = RGB(236, 160, 0);
-constexpr COLORREF C_BAD = RGB(214, 69, 69);
+// Tema oscuro futurista: fondo #0B0F1A, paneles #121826, acentos cian #00E5FF y violeta #7C4DFF
+constexpr COLORREF C_BG = RGB(11, 15, 26);
+constexpr COLORREF C_CARD = RGB(18, 24, 38);
+constexpr COLORREF C_SIDE = RGB(9, 12, 22);
+constexpr COLORREF C_SIDE_HOT = RGB(22, 30, 50);
+constexpr COLORREF C_ACCENT = RGB(0, 229, 255);
+constexpr COLORREF C_ACCENT_HOT = RGB(110, 240, 255);
+constexpr COLORREF C_VIOLET = RGB(124, 77, 255);
+constexpr COLORREF C_BORDER = RGB(40, 51, 76);
+constexpr COLORREF C_TEXT = RGB(232, 237, 247);
+constexpr COLORREF C_MUTED = RGB(138, 151, 176);
+constexpr COLORREF C_OK = RGB(0, 230, 118);
+constexpr COLORREF C_WARN = RGB(255, 179, 0);
+constexpr COLORREF C_BAD = RGB(255, 61, 113);
 constexpr COLORREF C_WHITE = RGB(255, 255, 255);
-constexpr COLORREF C_SIDE_TEXT = RGB(190, 205, 220);
+constexpr COLORREF C_ON_ACCENT = RGB(4, 14, 26);
+constexpr COLORREF C_SIDE_TEXT = RGB(150, 163, 190);
 
 // ----------------------------------------------------------------------------- ids y mensajes
 
@@ -79,7 +91,7 @@ enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS,
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
-    NAV_UPDATE = NAV_BASE + 2, NAV_QUARANTINE = NAV_BASE + 3,  // = NAV_BASE + PG_UPDATE / PG_QUARANTINE
+    NAV_SCAN = NAV_BASE + 1, NAV_UPDATE = NAV_BASE + 2, NAV_QUARANTINE = NAV_BASE + 3,  // = NAV_BASE + PG_UPDATE / PG_QUARANTINE
     ID_SCAN_QUICK = 200, ID_SCAN_FULL, ID_SCAN_FOLDER, ID_CANCEL, ID_ISOLATE,
     ID_UPDATE_NOW, ID_IMPORT_FILE, ID_Q_RESTORE, ID_Q_DELETE, ID_Q_REFRESH,
     ID_LOG_OPEN, ID_LOG_REFRESH, ID_TOGGLE_PROTECTION, ID_SAVE_SETTINGS, ID_FIX,
@@ -104,6 +116,7 @@ constexpr UINT WM_APP_APPCHECK_DONE = WM_APP + 5;
 constexpr UINT WM_APP_APPDL_DONE = WM_APP + 6;
 constexpr UINT_PTR TIMER_REFRESH = 1;
 constexpr UINT_PTR TIMER_LOGPOLL = 2;
+constexpr UINT_PTR TIMER_ANIM = 4;
 constexpr UINT_PTR TIMER_APPCHECK = 3;
 constexpr int IDC_LIST = 1001;
 constexpr int IDC_PROGRESS = 1002;
@@ -116,6 +129,8 @@ struct Settings { bool autoQuarantine{true}, decoys{true}, scanUsb{true}, notify
                        scanDownloads{true}, closeToTray{true}, autostart{false}; };
 
 struct DownloadResult { bool ok{false}; std::wstring path; std::wstring error; };
+
+struct Toast { std::wstring text; COLORREF color; ULONGLONG expire; };
 
 struct AppState {
     HWND main{}, list{}, progress{};
@@ -160,7 +175,19 @@ struct AppState {
     bool trayHintShown{false};
     HANDLE instanceMutex{nullptr};
     // Configuración con desplazamiento
+    // Diseño: GDI+, animación y datos en caché para la pantalla de inicio
+    Gdiplus::Graphics* gfx{nullptr};
+    ULONG_PTR gdiplusToken{0};
+    double animPhase{0};
+    RECT animRect{};
+    std::vector<Toast> toasts;
+    std::vector<openguard::HistoryEvent> feed;
+    int chartCounts[7]{};
+    size_t threatsBlocked{0}, threatsDetected{0}, totalScanned{0};
+    std::wstring lastScanText, lastUpdateText, isoText;
+    ULONGLONG homeCacheTick{0};
     int settingsScroll{0}, settingsMaxScroll{0};
+
     RECT clipRect{};
     bool clipOn{false};                           // el análisis en curso conoce su total (barra determinada)
     std::shared_ptr<openguard::IsolatedScanner> isolated;     // análisis aislado para los análisis manuales
@@ -170,6 +197,14 @@ struct AppState {
 int S(int v) { return static_cast<int>(v * g.scale + 0.5); }
 RECT R(int l, int t, int r, int b) { RECT rc{l, t, r, b}; return rc; }
 std::wstring W(const std::string& utf8) { return openguard::paths::fromUtf8(utf8).wstring(); }
+
+/// Notificación flotante dentro de la ventana (se desvanece sola a los pocos segundos).
+void pushToast(const std::wstring& text, COLORREF color, unsigned ms = 4500) {
+    if (g.toasts.size() >= 3) g.toasts.erase(g.toasts.begin());
+    g.toasts.push_back({text, color, GetTickCount64() + ms});
+    if (g.main) InvalidateRect(g.main, nullptr, FALSE);
+}
+
 
 // ----------------------------------------------------------------------------- ajustes (ini)
 
@@ -598,27 +633,83 @@ std::vector<fs::path> quickTargets() {
 }
 
 // ----------------------------------------------------------------------------- dibujo básico
+// Las formas se dibujan con GDI+ (suavizado, degradados, transparencia); el texto con GDI (ClearType).
+
+Gdiplus::Color gc(COLORREF c, BYTE alpha = 255) { return Gdiplus::Color(alpha, GetRValue(c), GetGValue(c), GetBValue(c)); }
+
+/// Mezcla dos colores (t = 0..1) para estados "hover".
+COLORREF mix(COLORREF a, COLORREF b, double t) {
+    return RGB(static_cast<int>(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
+               static_cast<int>(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
+               static_cast<int>(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
+}
+
+/// Sincroniza GDI+ antes de usar GDI sobre el mismo HDC (evita problemas de orden de dibujo).
+void flushGdi() { if (g.gfx) g.gfx->Flush(Gdiplus::FlushIntentionSync); }
+
+void addRoundPath(Gdiplus::GraphicsPath& path, RECT rc, int radius) {
+    const float w = static_cast<float>(rc.right - rc.left);
+    const float h = static_cast<float>(rc.bottom - rc.top);
+    const float d = std::min(static_cast<float>(radius) * 2.0f, std::min(w, h));
+    const float x = static_cast<float>(rc.left), y = static_cast<float>(rc.top);
+    if (d <= 1.0f) { path.AddRectangle(Gdiplus::RectF(x, y, w, h)); return; }
+    path.AddArc(x, y, d, d, 180.0f, 90.0f);
+    path.AddArc(x + w - d, y, d, d, 270.0f, 90.0f);
+    path.AddArc(x + w - d, y + h - d, d, d, 0.0f, 90.0f);
+    path.AddArc(x, y + h - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+}
 
 void fillRect(HDC hdc, RECT rc, COLORREF c) {
+    flushGdi();
     HBRUSH b = CreateSolidBrush(c);
     FillRect(hdc, &rc, b);
     DeleteObject(b);
 }
 
-void roundRect(HDC hdc, RECT rc, int radius, COLORREF fill, COLORREF border, bool hasBorder) {
-    HBRUSH b = CreateSolidBrush(fill);
-    HPEN p = hasBorder ? CreatePen(PS_SOLID, 1, border) : static_cast<HPEN>(GetStockObject(NULL_PEN));
-    HGDIOBJ ob = SelectObject(hdc, b);
-    HGDIOBJ op = SelectObject(hdc, p);
-    RoundRect(hdc, rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius, radius);
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(b);
-    if (hasBorder) DeleteObject(p);
+void roundRect(HDC, RECT rc, int radius, COLORREF fill, COLORREF border, bool hasBorder) {
+    if (!g.gfx) return;
+    Gdiplus::GraphicsPath p;
+    addRoundPath(p, rc, radius);
+    Gdiplus::SolidBrush b(gc(fill));
+    g.gfx->FillPath(&b, &p);
+    if (hasBorder) {
+        Gdiplus::Pen pen(gc(border), 1.0f);
+        g.gfx->DrawPath(&pen, &p);
+    }
+}
+
+/// Resplandor suave alrededor de un rectángulo redondeado (varias capas translúcidas).
+void glowRound(RECT rc, int radius, COLORREF color, int layers, BYTE maxAlpha) {
+    if (!g.gfx) return;
+    for (int i = layers; i >= 1; --i) {
+        RECT e = R(rc.left - S(2) * i, rc.top - S(2) * i, rc.right + S(2) * i, rc.bottom + S(2) * i);
+        Gdiplus::GraphicsPath p;
+        addRoundPath(p, e, radius + S(2) * i);
+        const BYTE a = static_cast<BYTE>(maxAlpha * (layers - i + 1) / (layers + 1) / 2);
+        Gdiplus::Pen pen(gc(color, a), static_cast<float>(S(2)));
+        g.gfx->DrawPath(&pen, &p);
+    }
+}
+
+/// Panel de cristal: degradado vertical sutil, borde fino semitransparente y brillo superior.
+void glassPanel(RECT rc, int radius, COLORREF border = C_BORDER, BYTE borderAlpha = 255) {
+    if (!g.gfx) return;
+    Gdiplus::GraphicsPath p;
+    addRoundPath(p, rc, radius);
+    Gdiplus::LinearGradientBrush br(Gdiplus::PointF(0.0f, static_cast<float>(rc.top)),
+                                    Gdiplus::PointF(0.0f, static_cast<float>(rc.bottom)),
+                                    gc(RGB(26, 35, 56)), gc(C_CARD));
+    g.gfx->FillPath(&br, &p);
+    Gdiplus::Pen pen(gc(border, borderAlpha), 1.0f);
+    g.gfx->DrawPath(&pen, &p);
+    Gdiplus::Pen hi(gc(C_WHITE, 22), 1.0f);
+    g.gfx->DrawLine(&hi, static_cast<int>(rc.left + radius), static_cast<int>(rc.top + 1), static_cast<int>(rc.right - radius), static_cast<int>(rc.top + 1));
 }
 
 void text(HDC hdc, const std::wstring& s, RECT rc, HFONT f, COLORREF c,
           UINT fmt = DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX) {
+    flushGdi();
     HGDIOBJ old = SelectObject(hdc, f);
     SetTextColor(hdc, c);
     DrawTextW(hdc, s.c_str(), -1, &rc, fmt);
@@ -636,54 +727,124 @@ void addHit(RECT rc, int id) {
 
 bool isHot(int id) { return g.hover == id; }
 
-void drawShield(HDC hdc, int cx, int cy, int size, COLORREF fill, COLORREF check) {
-    static const double pts[8][2] = {{0, -1}, {0.85, -0.72}, {0.85, 0.1}, {0.6, 0.6}, {0, 1}, {-0.6, 0.6}, {-0.85, 0.1}, {-0.85, -0.72}};
-    POINT p[8];
-    for (int i = 0; i < 8; ++i) {
-        p[i].x = cx + static_cast<LONG>(pts[i][0] * size / 2);
-        p[i].y = cy + static_cast<LONG>(pts[i][1] * size / 2);
+/// Recorte común a GDI y GDI+ (contenido desplazable). Devuelve el estado para restaurarlo con endClip().
+struct ClipState { int dc{0}; Gdiplus::GraphicsState gs{0}; };
+ClipState beginClip(HDC hdc, RECT rc) {
+    ClipState st;
+    flushGdi();
+    st.dc = SaveDC(hdc);
+    IntersectClipRect(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    if (g.gfx) {
+        st.gs = g.gfx->Save();
+        g.gfx->SetClip(Gdiplus::Rect(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top), Gdiplus::CombineModeIntersect);
     }
-    HBRUSH b = CreateSolidBrush(fill);
-    HGDIOBJ ob = SelectObject(hdc, b);
-    HGDIOBJ op = SelectObject(hdc, GetStockObject(NULL_PEN));
-    Polygon(hdc, p, 8);
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(b);
+    return st;
+}
+void endClip(HDC hdc, const ClipState& st) {
+    flushGdi();
+    if (g.gfx) g.gfx->Restore(st.gs);
+    RestoreDC(hdc, st.dc);
+}
 
-    LOGBRUSH lb{BS_SOLID, check, 0};
-    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, std::max(2, size / 11), &lb, 0, nullptr);
-    HGDIOBJ opn = SelectObject(hdc, pen);
-    POINT c[3] = {{cx - size * 22 / 100, cy + size * 2 / 100}, {cx - size * 6 / 100, cy + size * 20 / 100}, {cx + size * 26 / 100, cy - size * 16 / 100}};
-    Polyline(hdc, c, 3);
-    SelectObject(hdc, opn);
-    DeleteObject(pen);
+/// Escudo con degradado, brillo y marca de verificación.
+void drawShield(HDC, int cx, int cy, int size, COLORREF fill, COLORREF check) {
+    if (!g.gfx) return;
+    static const double pts[8][2] = {{0, -1}, {0.85, -0.72}, {0.85, 0.1}, {0.6, 0.6}, {0, 1}, {-0.6, 0.6}, {-0.85, 0.1}, {-0.85, -0.72}};
+    Gdiplus::PointF p[8];
+    for (int i = 0; i < 8; ++i) {
+        p[i] = Gdiplus::PointF(static_cast<float>(cx + pts[i][0] * size / 2), static_cast<float>(cy + pts[i][1] * size / 2));
+    }
+    Gdiplus::GraphicsPath path;
+    path.AddCurve(p, 8, 0.18f);
+    path.CloseFigure();
+
+    for (int i = 3; i >= 1; --i) { // resplandor
+        Gdiplus::Pen glow(gc(fill, static_cast<BYTE>(30 / i)), static_cast<float>(S(3) * i));
+        g.gfx->DrawPath(&glow, &path);
+    }
+    Gdiplus::LinearGradientBrush br(Gdiplus::PointF(0.0f, static_cast<float>(cy - size / 2)),
+                                    Gdiplus::PointF(0.0f, static_cast<float>(cy + size / 2)),
+                                    gc(mix(fill, C_WHITE, 0.35)), gc(mix(fill, C_BG, 0.25)));
+    g.gfx->FillPath(&br, &path);
+
+    Gdiplus::Pen chk(gc(check), static_cast<float>(std::max(2, size / 9)));
+    chk.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+    chk.SetLineJoin(Gdiplus::LineJoinRound);
+    const Gdiplus::PointF c[3] = {Gdiplus::PointF(static_cast<float>(cx - size * 0.22), static_cast<float>(cy + size * 0.02)),
+                                  Gdiplus::PointF(static_cast<float>(cx - size * 0.06), static_cast<float>(cy + size * 0.20)),
+                                  Gdiplus::PointF(static_cast<float>(cx + size * 0.26), static_cast<float>(cy - size * 0.16))};
+    g.gfx->DrawLines(&chk, c, 3);
+}
+
+/// Anillo de estado animado: pulso expansivo, aro y arco brillante giratorio con el escudo al centro.
+void drawStatusRing(HDC hdc, int cx, int cy, int radius, COLORREF color, double phase) {
+    if (!g.gfx) return;
+    // Pulsos que se expanden y se desvanecen
+    for (int k = 0; k < 3; ++k) {
+        const double t = std::fmod(phase * 1.2 + k / 3.0, 1.0);
+        const float r = static_cast<float>(radius + t * S(30));
+        Gdiplus::Pen pulse(gc(color, static_cast<BYTE>((1.0 - t) * 70)), static_cast<float>(S(2)));
+        g.gfx->DrawEllipse(&pulse, cx - r, cy - r, r * 2, r * 2);
+    }
+    // Disco interior tenue
+    Gdiplus::SolidBrush disc(gc(color, 26));
+    g.gfx->FillEllipse(&disc, cx - radius + S(8), cy - radius + S(8), (radius - S(8)) * 2, (radius - S(8)) * 2);
+
+    // Aro base y arco brillante que gira
+    const float pw = static_cast<float>(S(9));
+    Gdiplus::Pen base(gc(color, 70), pw);
+    g.gfx->DrawEllipse(&base, cx - radius, cy - radius, radius * 2, radius * 2);
+
+    Gdiplus::LinearGradientBrush grad(Gdiplus::PointF(static_cast<float>(cx - radius), static_cast<float>(cy)),
+                                      Gdiplus::PointF(static_cast<float>(cx + radius), static_cast<float>(cy)),
+                                      gc(mix(color, C_WHITE, 0.4)), gc(C_VIOLET));
+    Gdiplus::Pen arc(&grad, pw);
+    arc.SetStartCap(Gdiplus::LineCapRound);
+    arc.SetEndCap(Gdiplus::LineCapRound);
+    g.gfx->DrawArc(&arc, cx - radius, cy - radius, radius * 2, radius * 2, static_cast<float>(phase * 360.0), 110.0f);
+
+    drawShield(hdc, cx, cy, static_cast<int>(radius * 1.15), color, C_BG);
 }
 
 enum BtnStyle { BS_PRIMARY, BS_SECONDARY, BS_DANGER, BS_ONBANNER };
 
 void drawButton(HDC hdc, RECT rc, const std::wstring& label, int id, BtnStyle style, bool enabled = true,
                 COLORREF bannerColor = C_ACCENT) {
+    (void)bannerColor;
     const bool hot = enabled && isHot(id);
-    COLORREF fill = C_ACCENT, border = C_ACCENT, fg = C_WHITE;
-    bool hasBorder = false;
-    switch (style) {
-        case BS_PRIMARY:   fill = hot ? C_ACCENT_HOT : C_ACCENT; break;
-        case BS_DANGER:    fill = hot ? RGB(185, 52, 52) : C_BAD; break;
-        case BS_SECONDARY: fill = hot ? RGB(232, 240, 246) : C_CARD; border = C_BORDER; fg = C_TEXT; hasBorder = true; break;
-        case BS_ONBANNER:  fill = hot ? RGB(235, 245, 240) : C_WHITE; fg = bannerColor; break;
+    const int radius = S(10);
+    COLORREF fg = C_TEXT;
+
+    if (!enabled) {
+        roundRect(hdc, rc, radius, RGB(28, 36, 56), C_BORDER, true);
+        fg = RGB(94, 106, 130);
+    } else if (style == BS_PRIMARY || style == BS_DANGER) {
+        const COLORREF a = style == BS_PRIMARY ? C_ACCENT : C_BAD;
+        const COLORREF b = style == BS_PRIMARY ? C_VIOLET : RGB(255, 112, 67);
+        if (hot) glowRound(rc, radius, a, 4, 120);
+        Gdiplus::GraphicsPath p;
+        addRoundPath(p, rc, radius);
+        Gdiplus::LinearGradientBrush br(Gdiplus::PointF(static_cast<float>(rc.left), 0.0f),
+                                        Gdiplus::PointF(static_cast<float>(rc.right), 0.0f),
+                                        gc(hot ? mix(a, C_WHITE, 0.25) : a), gc(hot ? mix(b, C_WHITE, 0.2) : b));
+        g.gfx->FillPath(&br, &p);
+        fg = style == BS_PRIMARY ? C_ON_ACCENT : C_WHITE;
+    } else if (style == BS_ONBANNER) {
+        roundRect(hdc, rc, radius, mix(C_CARD, C_WHITE, hot ? 0.25 : 0.12), C_BORDER, true);
+    } else { // SECONDARY: cristal con borde que se ilumina
+        if (hot) glowRound(rc, radius, C_ACCENT, 3, 90);
+        glassPanel(rc, radius, hot ? C_ACCENT : C_BORDER, 255);
     }
-    if (!enabled) { fill = RGB(226, 231, 236); fg = RGB(150, 160, 170); hasBorder = false; }
-    roundRect(hdc, rc, S(8), fill, border, hasBorder);
     text(hdc, label, rc, g.fBold, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (enabled) addHit(rc, id);
 }
 
-void drawCard(HDC hdc, RECT rc) { roundRect(hdc, rc, S(12), C_CARD, C_BORDER, true); }
+void drawCard(HDC, RECT rc) { glassPanel(rc, S(16)); }
 
 void drawCardButton(HDC hdc, RECT rc, const std::wstring& title, const std::wstring& desc, int id, bool enabled = true) {
     const bool hot = enabled && isHot(id);
-    roundRect(hdc, rc, S(12), hot ? RGB(240, 251, 249) : C_CARD, hot ? C_ACCENT : C_BORDER, true);
+    if (hot) glowRound(rc, S(16), C_ACCENT, 3, 80);
+    glassPanel(rc, S(16), hot ? C_ACCENT : C_BORDER, 255);
     RECT t = R(rc.left + S(18), rc.top + S(16), rc.right - S(18), rc.top + S(44));
     text(hdc, title, t, g.fH2, enabled ? C_TEXT : C_MUTED, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
     RECT d = R(rc.left + S(18), rc.top + S(48), rc.right - S(18), rc.bottom - S(12));
@@ -691,18 +852,28 @@ void drawCardButton(HDC hdc, RECT rc, const std::wstring& title, const std::wstr
     if (enabled) addHit(rc, id);
 }
 
-void drawToggle(HDC hdc, int x, int y, bool on, int id) {
+void drawToggle(HDC, int x, int y, bool on, int id) {
+    if (!g.gfx) return;
     RECT rc = R(x, y, x + S(46), y + S(24));
-    roundRect(hdc, rc, S(24), on ? C_ACCENT : RGB(190, 200, 210), C_BORDER, false);
+    Gdiplus::GraphicsPath p;
+    addRoundPath(p, rc, S(12));
+    if (on) {
+        glowRound(rc, S(12), C_ACCENT, 2, 70);
+        Gdiplus::LinearGradientBrush br(Gdiplus::PointF(static_cast<float>(rc.left), 0.0f),
+                                        Gdiplus::PointF(static_cast<float>(rc.right), 0.0f), gc(C_ACCENT), gc(C_VIOLET));
+        g.gfx->FillPath(&br, &p);
+    } else {
+        Gdiplus::SolidBrush off(gc(RGB(46, 57, 82)));
+        g.gfx->FillPath(&off, &p);
+        Gdiplus::Pen outline(gc(C_BORDER), 1.0f);
+        g.gfx->DrawPath(&outline, &p);
+    }
     const int knob = S(18);
     const int kx = on ? rc.right - knob - S(3) : rc.left + S(3);
-    HBRUSH b = CreateSolidBrush(C_WHITE);
-    HGDIOBJ ob = SelectObject(hdc, b);
-    HGDIOBJ op = SelectObject(hdc, GetStockObject(NULL_PEN));
-    Ellipse(hdc, kx, rc.top + S(3), kx + knob, rc.top + S(3) + knob);
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(b);
+    Gdiplus::SolidBrush shadow(gc(RGB(0, 0, 0), 60));
+    g.gfx->FillEllipse(&shadow, kx, rc.top + S(4), knob, knob);
+    Gdiplus::SolidBrush kb(gc(C_WHITE));
+    g.gfx->FillEllipse(&kb, kx, rc.top + S(3), knob, knob);
     addHit(R(x - S(4), y - S(4), x + S(50), y + S(28)), id);
 }
 
@@ -951,6 +1122,17 @@ void onScanDone(openguard::ScanSessionStats* stats) {
                    std::to_wstring(owned->duration.count() / 1000) + L" s";
     iniSetStr(guiIni(), L"stats", L"last_scan", nowText());
     iniSetStr(guiIni(), L"stats", L"last_threats", std::to_wstring(owned->threatsFound));
+    {
+        const UINT prevTotal = GetPrivateProfileIntW(L"stats", L"total_scanned", 0, guiIni().c_str());
+        iniSetStr(guiIni(), L"stats", L"total_scanned", std::to_wstring(static_cast<size_t>(prevTotal) + owned->filesScanned));
+    }
+    g.homeCacheTick = 0; // fuerza recalcular las cifras de la pantalla de inicio
+    if (owned->threatsFound > 0) {
+        pushToast(L"Analisis completado: " + std::to_wstring(owned->threatsFound) + L" amenazas encontradas", C_BAD, 6000);
+    } else {
+        pushToast(L"Analisis completado: " + std::to_wstring(owned->filesScanned) + L" archivos, sin amenazas", C_OK);
+    }
+
     refreshData();
     InvalidateRect(g.main, nullptr, FALSE);
 
@@ -1065,7 +1247,10 @@ void onUpdateDone(openguard::UpdateResult* res) {
         g.updateMsg = L"Actualizacion completada: " + std::to_wstring(owned->inserted) + L" firmas nuevas, " +
                       std::to_wstring(owned->skipped) + L" ya existentes u omitidas.";
         iniSetStr(guiIni(), L"stats", L"last_update", nowText());
+        g.homeCacheTick = 0;
+        pushToast(L"Firmas actualizadas: " + std::to_wstring(owned->inserted) + L" nuevas", C_OK);
     } else {
+        pushToast(L"No se pudo actualizar las firmas", C_WARN);
         g.updateMsg = L"No se pudo actualizar: " + W(owned->error);
     }
     refreshData();
@@ -1261,6 +1446,7 @@ void pollServiceLog() {
     }
     g_logOffset = size;
 
+    if (alerts > 0) pushToast(W(lastAlert.size() > 20 ? lastAlert.substr(20) : lastAlert), C_BAD, 6500);
     if (alerts > 0 && g.settings.notify) {
         const std::string body = lastAlert.size() > 20 ? lastAlert.substr(20) : lastAlert;
         showBalloon(alerts > 1 ? L"OpenGuard: " + std::to_wstring(alerts) + L" alertas" : L"OpenGuard: alerta de seguridad",
@@ -1294,45 +1480,71 @@ Status computeStatus() {
 
 void paintSidebar(HDC hdc, int h) {
     const int sw = S(232);
-    fillRect(hdc, R(0, 0, sw, h), C_SIDE);
 
+    // Fondo con degradado vertical y borde derecho fino
+    {
+        Gdiplus::LinearGradientBrush br(Gdiplus::PointF(0.0f, 0.0f), Gdiplus::PointF(0.0f, static_cast<float>(h)),
+                                        gc(RGB(13, 18, 32)), gc(RGB(8, 10, 19)));
+        g.gfx->FillRectangle(&br, 0, 0, sw, h);
+        Gdiplus::Pen edge(gc(C_BORDER, 200), 1.0f);
+        g.gfx->DrawLine(&edge, sw - 1, 0, sw - 1, h);
+    }
+
+    flushGdi();
     if (g.icon) DrawIconEx(hdc, S(20), S(22), g.icon, S(44), S(44), 0, nullptr, DI_NORMAL);
-    text(hdc, L"OpenGuard", R(S(72), S(22), sw - S(8), S(46)), g.fH2, C_WHITE, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    text(hdc, L"Antivirus", R(S(72), S(44), sw - S(8), S(66)), g.fSmall, C_SIDE_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"OPENGUARD", R(S(72), S(22), sw - S(8), S(46)), g.fH2, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, L"A N T I V I R U S", R(S(72), S(46), sw - S(8), S(66)), g.fSmall, C_ACCENT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
     static const wchar_t* names[PG_COUNT] = {L"Inicio", L"Analisis", L"Actualizacion", L"Cuarentena", L"Informes", L"Configuracion"};
     static const wchar_t* glyphs[PG_COUNT] = {L"\xE80F", L"\xE721", L"\xE895", L"\xE72E", L"\xE8A5", L"\xE713"};
     int y = S(104);
     for (int i = 0; i < PG_COUNT; ++i) {
-        RECT item = R(0, y, sw, y + S(48));
+        RECT item = R(S(10), y, sw - S(10), y + S(46));
         const bool sel = (g.page == i) || (i == PG_SETTINGS && (g.page == PG_EXCLUSIONS || g.page == PG_SCHEDULE));
-        if (sel || isHot(NAV_BASE + i)) fillRect(hdc, item, C_SIDE_HOT);
-        if (sel) fillRect(hdc, R(0, y, S(4), y + S(48)), C_ACCENT);
-        text(hdc, glyphs[i], R(S(24), y, S(52), y + S(48)), g.fIcon, sel ? C_ACCENT : C_SIDE_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        text(hdc, names[i], R(S(62), y, sw - S(8), y + S(48)), g.fBody, sel ? C_WHITE : C_SIDE_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        const bool hot = isHot(NAV_BASE + i);
+        if (sel || hot) {
+            Gdiplus::GraphicsPath p;
+            addRoundPath(p, item, S(12));
+            if (sel) {
+                Gdiplus::LinearGradientBrush br(Gdiplus::PointF(static_cast<float>(item.left), 0.0f),
+                                                Gdiplus::PointF(static_cast<float>(item.right), 0.0f), gc(C_ACCENT, 46), gc(C_VIOLET, 22));
+                g.gfx->FillPath(&br, &p);
+                Gdiplus::Pen pen(gc(C_ACCENT, 90), 1.0f);
+                g.gfx->DrawPath(&pen, &p);
+                // Barra lateral luminosa
+                Gdiplus::LinearGradientBrush bar(Gdiplus::PointF(0.0f, static_cast<float>(item.top)),
+                                                 Gdiplus::PointF(0.0f, static_cast<float>(item.bottom)), gc(C_ACCENT), gc(C_VIOLET));
+                g.gfx->FillRectangle(&bar, 0, static_cast<int>(item.top) + S(8), S(4), S(30));
+            } else {
+                Gdiplus::SolidBrush br(gc(C_WHITE, 14));
+                g.gfx->FillPath(&br, &p);
+            }
+        }
+        text(hdc, glyphs[i], R(S(26), y, S(54), y + S(46)), g.fIcon, sel ? C_ACCENT : (hot ? C_TEXT : C_SIDE_TEXT), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, names[i], R(S(64), y, sw - S(8), y + S(46)), g.fBody, sel ? C_TEXT : (hot ? C_TEXT : C_SIDE_TEXT), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         addHit(item, NAV_BASE + i);
         y += S(52);
     }
 
     // Estado del servicio y versión al pie
     const bool on = (g.svc == Svc::Running);
-    HBRUSH b = CreateSolidBrush(on ? C_OK : C_BAD);
-    HGDIOBJ ob = SelectObject(hdc, b);
-    HGDIOBJ op = SelectObject(hdc, GetStockObject(NULL_PEN));
-    Ellipse(hdc, S(24), h - S(70), S(34), h - S(60));
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(b);
-    text(hdc, on ? L"Proteccion activa" : L"Proteccion inactiva", R(S(42), h - S(76), sw - S(8), h - S(54)), g.fSmall, C_SIDE_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    text(hdc, W(std::string("Version ") + OPENGUARD_VERSION), R(S(24), h - S(46), sw - S(8), h - S(24)), g.fSmall, RGB(120, 140, 160), DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    const COLORREF stateColor = on ? C_OK : C_BAD;
+    Gdiplus::SolidBrush halo(gc(stateColor, 50));
+    g.gfx->FillEllipse(&halo, S(20), h - S(76), S(18), S(18));
+    Gdiplus::SolidBrush dot(gc(stateColor));
+    g.gfx->FillEllipse(&dot, S(24), h - S(72), S(10), S(10));
+    text(hdc, on ? L"Proteccion activa" : L"Proteccion inactiva", R(S(46), h - S(80), sw - S(8), h - S(58)), g.fSmall, C_SIDE_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, W(std::string("Version ") + OPENGUARD_VERSION), R(S(24), h - S(48), sw - S(8), h - S(26)), g.fSmall, RGB(96, 108, 134), DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 }
 
 void pageHeader(HDC hdc, int w, const std::wstring& title, const std::wstring& subtitle) {
-    text(hdc, title, R(S(264), S(28), w - S(28), S(66)), g.fH1, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    text(hdc, subtitle, R(S(264), S(66), w - S(28), S(92)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, title, R(S(264), S(24), w - S(28), S(66)), g.fH1, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    text(hdc, subtitle, R(S(264), S(66), w - S(28), S(90)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    Gdiplus::LinearGradientBrush bar(Gdiplus::PointF(static_cast<float>(S(264)), 0.0f), Gdiplus::PointF(static_cast<float>(S(264) + S(70)), 0.0f),
+                                     gc(C_ACCENT), gc(C_VIOLET));
+    g.gfx->FillRectangle(&bar, S(264), S(94), S(70), S(3));
 }
 
-/// Estado del análisis aislado según lo que publica el servicio en status.ini.
 std::wstring isolationText() {
     const fs::path ini = openguard::paths::dataDir() / L"status.ini";
     const std::wstring mode = iniGetStr(ini, L"isolation", L"mode", L"");
@@ -1346,72 +1558,203 @@ std::wstring isolationText() {
 
 std::wstring scheduleSummary(); // definida con la pantalla de programación
 
+/// Datos de la pantalla de inicio (se recalculan como máximo cada 3 s para que la animación sea fluida).
+void refreshHomeCache() {
+    const ULONGLONG now = GetTickCount64();
+    if (g.homeCacheTick != 0 && now - g.homeCacheTick < 3000) return;
+    g.homeCacheTick = now;
+
+    g.isoText = isolationText();
+    g.lastScanText = iniGetStr(guiIni(), L"stats", L"last_scan", L"Nunca");
+    g.lastUpdateText = iniGetStr(guiIni(), L"stats", L"last_update", L"Nunca");
+    g.totalScanned = static_cast<size_t>(GetPrivateProfileIntW(L"stats", L"total_scanned", 0, guiIni().c_str()));
+
+    if (!g.history) return;
+    g.threatsBlocked = g.history->count("quarantine");
+    g.threatsDetected = g.history->count("detection");
+    g.feed = g.history->recent(6);
+
+    // Detecciones de los últimos 7 días (día de calendario local)
+    std::fill(std::begin(g.chartCounts), std::end(g.chartCounts), 0);
+    const std::time_t nowT = std::time(nullptr);
+    std::tm today{};
+    localtime_s(&today, &nowT);
+    today.tm_hour = today.tm_min = today.tm_sec = 0;
+    today.tm_isdst = -1;
+    const std::time_t todayStart = std::mktime(&today);
+    for (const auto& e : g.history->recent(3000)) {
+        if (e.kind != "detection" && e.kind != "ransomware") continue;
+        const std::time_t t = openguard::parseLocalStamp(e.timestamp);
+        if (t == 0 || t > nowT + 60) continue;
+        const int daysAgo = static_cast<int>(std::floor(std::difftime(todayStart, t) / 86400.0 + 0.999999));
+        const int d = std::max(0, daysAgo);
+        if (d < 7) g.chartCounts[6 - d]++;
+    }
+}
+
 void paintHome(HDC hdc, int w, int h) {
+    refreshHomeCache();
     pageHeader(hdc, w, L"Inicio", L"Estado general de la proteccion de su equipo");
     const RECT body = bodyRect(w, h);
     const int bw = body.right - body.left;
-
-    // Banner de estado
     const Status st = computeStatus();
-    RECT banner = R(body.left, body.top, body.right, body.top + S(160));
-    roundRect(hdc, banner, S(16), st.color, st.color, false);
-    drawShield(hdc, banner.left + S(86), banner.top + S(80), S(96), C_WHITE, st.color);
-    text(hdc, st.title, R(banner.left + S(166), banner.top + S(28), banner.right - S(24), banner.top + S(72)), g.fBig, C_WHITE, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    text(hdc, st.subtitle, R(banner.left + S(166), banner.top + S(76), banner.right - S(24), banner.top + S(116)), g.fBody, C_WHITE);
-    if (st.actionId != 0) {
-        drawButton(hdc, R(banner.left + S(166), banner.bottom - S(50), banner.left + S(166) + S(200), banner.bottom - S(14)),
-                   st.action, st.actionId, BS_ONBANNER, true, st.color);
-    }
+    int y = body.top;
 
     // Aviso de nueva versión del programa
-    int extra = 0;
     if (g.appInfo.available) {
-        RECT strip = R(body.left, banner.bottom + S(12), body.right, banner.bottom + S(12) + S(46));
-        roundRect(hdc, strip, S(10), RGB(228, 240, 252), RGB(150, 190, 230), true);
+        RECT strip = R(body.left, y, body.right, y + S(44));
+        glassPanel(strip, S(12), C_ACCENT, 170);
         text(hdc, L"Nueva version disponible: OpenGuard " + W(g.appInfo.latestVersion),
-             R(strip.left + S(18), strip.top, strip.right - S(200), strip.bottom), g.fBold, RGB(20, 70, 130), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        drawButton(hdc, R(strip.right - S(180), strip.top + S(7), strip.right - S(10), strip.bottom - S(7)), L"Ver actualizacion", NAV_UPDATE, BS_PRIMARY);
-        extra = S(58);
+             R(strip.left + S(18), strip.top, strip.right - S(210), strip.bottom), g.fBold, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        drawButton(hdc, R(strip.right - S(190), strip.top + S(5), strip.right - S(8), strip.bottom - S(5)), L"Ver actualizacion", NAV_UPDATE, BS_PRIMARY);
+        y += S(56);
     }
 
-    // Tarjetas de acciones
-    const int gap = S(16);
-    const int cw = (bw - 3 * gap) / 4;
-    const int ctop = banner.bottom + S(22) + extra;
-    const int ch = S(124);
-    drawCardButton(hdc, R(body.left, ctop, body.left + cw, ctop + ch), L"Analisis rapido",
-                   L"Descargas, Escritorio, Documentos y Temp", ID_SCAN_QUICK, !g.scanning);
-    drawCardButton(hdc, R(body.left + (cw + gap), ctop, body.left + (cw + gap) + cw, ctop + ch), L"Analisis completo",
-                   L"Todas las unidades fijas del equipo", ID_SCAN_FULL, !g.scanning);
-    drawCardButton(hdc, R(body.left + 2 * (cw + gap), ctop, body.left + 2 * (cw + gap) + cw, ctop + ch), L"Actualizacion",
-                   std::to_wstring(g.sigCount) + L" firmas y " + std::to_wstring(g.yaraCount) + L" reglas YARA", NAV_UPDATE);
-    drawCardButton(hdc, R(body.left + 3 * (cw + gap), ctop, body.left + 3 * (cw + gap) + cw, ctop + ch), L"Cuarentena",
-                   std::to_wstring(g.quarantineCount) + L" elementos aislados", NAV_QUARANTINE);
+    // ---- Panel principal: anillo de estado animado, mensaje y botón grande de escanear
+    const int heroH = S(196);
+    const RECT hero = R(body.left, y, body.right, y + heroH);
+    glassPanel(hero, S(20));
+    {
+        Gdiplus::GraphicsPath p;
+        addRoundPath(p, hero, S(20));
+        Gdiplus::LinearGradientBrush tint(Gdiplus::PointF(static_cast<float>(hero.left), 0.0f),
+                                          Gdiplus::PointF(static_cast<float>(hero.left) + bw * 0.7f, 0.0f), gc(st.color, 48), gc(st.color, 0));
+        g.gfx->FillPath(&tint, &p);
+    }
+    const int ringR = S(58);
+    const int cx = hero.left + S(108), cy = hero.top + heroH / 2;
+    g.animRect = R(cx - ringR - S(40), cy - ringR - S(40), cx + ringR + S(40), cy + ringR + S(40));
+    drawStatusRing(hdc, cx, cy, ringR, st.color, g.animPhase);
 
-    // Resumen
-    RECT info = R(body.left, ctop + ch + S(22), body.right, std::min<int>(body.bottom, ctop + ch + S(22) + S(150)));
-    if (info.bottom - info.top < S(60)) return; // ventana muy baja: se omite el resumen
-    drawCard(hdc, info);
-    const std::wstring lastScan = iniGetStr(guiIni(), L"stats", L"last_scan", L"Nunca");
-    const std::wstring lastThreats = iniGetStr(guiIni(), L"stats", L"last_threats", L"-");
-    const std::wstring lastUpdate = iniGetStr(guiIni(), L"stats", L"last_update", L"Nunca");
-    const wchar_t* svcText = g.svc == Svc::Running ? L"Activa" : g.svc == Svc::NotInstalled ? L"No instalada" : g.svc == Svc::Pending ? L"Cambiando de estado" : L"Desactivada";
-    const std::pair<std::wstring, std::wstring> rows[] = {
-        {L"Proteccion en tiempo real", svcText},
-        {L"Analisis aislado", isolationText()},
-        {L"Analisis programado", scheduleSummary()},
-        {L"Ultimo analisis", lastScan + (lastThreats == L"-" ? L"" : L"  (" + lastThreats + L" amenazas)")},
-        {L"Ultima actualizacion de firmas", lastUpdate},
-        {L"Motor", W(std::string("OpenGuard ") + OPENGUARD_VERSION) + L"  |  Firmas + YARA + Heuristica PE/Scripts"},
+    const int tx = hero.left + S(220);
+    const int textRight = hero.right - S(276);
+    text(hdc, st.title, R(tx, hero.top + S(24), textRight, hero.top + S(70)), g.fBig, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    text(hdc, st.subtitle, R(tx, hero.top + S(74), textRight, hero.top + S(122)), g.fBody, C_MUTED);
+    const int by = hero.bottom - S(64);
+    drawButton(hdc, R(tx, by, tx + S(172), by + S(44)), g.scanning ? L"ANALIZANDO..." : L"ESCANEAR", ID_SCAN_QUICK, BS_PRIMARY, !g.scanning);
+    drawButton(hdc, R(tx + S(184), by, tx + S(184) + S(140), by + S(44)), L"Completo", ID_SCAN_FULL, BS_SECONDARY, !g.scanning);
+    if (st.actionId != 0) {
+        drawButton(hdc, R(tx + S(336), by, textRight + S(20), by + S(44)), st.action, st.actionId, BS_SECONDARY);
+    }
+
+    // Indicadores de estado (píldoras)
+    {
+        const bool svcOn = (g.svc == Svc::Running);
+        const bool isoOn = g.isoText.rfind(L"Activo", 0) == 0;
+        const wchar_t* usb = g.prot.usbMode == "auto" ? L"Automatico" : g.prot.usbMode == "off" ? L"Desactivado" : L"Preguntar";
+        struct Chip { const wchar_t* label; std::wstring value; COLORREF color; };
+        const Chip chips[] = {
+            {L"Tiempo real", svcOn ? L"Activo" : L"Inactivo", svcOn ? C_OK : C_BAD},
+            {L"Descargas", g.prot.scanDownloads ? L"Vigiladas" : L"Sin vigilar", g.prot.scanDownloads ? C_OK : C_WARN},
+            {L"Unidades USB", usb, g.prot.usbMode == "off" ? C_WARN : C_OK},
+            {L"Aislamiento", isoOn ? L"Activo" : L"Revisar", isoOn ? C_OK : C_WARN},
+        };
+        int cy2 = hero.top + S(18);
+        const int cxL = hero.right - S(256);
+        for (const auto& c : chips) {
+            const RECT pill = R(cxL, cy2, hero.right - S(18), cy2 + S(34));
+            glassPanel(pill, S(17));
+            Gdiplus::SolidBrush halo(gc(c.color, 50));
+            g.gfx->FillEllipse(&halo, static_cast<int>(pill.left) + S(10), static_cast<int>(pill.top) + S(9), S(16), S(16));
+            Gdiplus::SolidBrush dot(gc(c.color));
+            g.gfx->FillEllipse(&dot, static_cast<int>(pill.left) + S(14), static_cast<int>(pill.top) + S(13), S(8), S(8));
+            text(hdc, c.label, R(pill.left + S(34), pill.top, pill.left + S(120), pill.bottom), g.fSmall, C_MUTED, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            text(hdc, c.value, R(pill.left + S(118), pill.top, pill.right - S(10), pill.bottom), g.fSmall, c.color, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            cy2 += S(42);
+        }
+    }
+
+    // ---- Tarjetas de estadísticas
+    y = hero.bottom + S(16);
+    const int sh = S(100), gap = S(16);
+    const int cw = (bw - 2 * gap) / 3;
+    auto stat = [&](int idx, const wchar_t* title, const std::wstring& value, const std::wstring& sub, COLORREF color, int id) {
+        const RECT rc = R(body.left + idx * (cw + gap), y, body.left + idx * (cw + gap) + cw, y + sh);
+        const bool hot = isHot(id);
+        if (hot) glowRound(rc, S(16), color, 3, 80);
+        glassPanel(rc, S(16), hot ? color : C_BORDER, 255);
+        text(hdc, title, R(rc.left + S(18), rc.top + S(12), rc.right - S(12), rc.top + S(30)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, value, R(rc.left + S(18), rc.top + S(28), rc.right - S(12), rc.top + S(68)), g.fBig, color, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, sub, R(rc.left + S(18), rc.bottom - S(26), rc.right - S(12), rc.bottom - S(8)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        addHit(rc, id);
     };
-    int ry = info.top + S(16);
-    const int maxRows = std::max<int>(1, (info.bottom - info.top - S(20)) / S(30));
-    int shown = 0;
-    for (const auto& row : rows) {
-        if (shown++ >= maxRows) break;
-        text(hdc, row.first, R(info.left + S(20), ry, info.left + S(300), ry + S(26)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-        text(hdc, row.second, R(info.left + S(310), ry, info.right - S(20), ry + S(26)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-        ry += S(30);
+    stat(0, L"ARCHIVOS ANALIZADOS", std::to_wstring(g.totalScanned), L"Ultimo analisis: " + g.lastScanText, C_ACCENT, NAV_SCAN);
+    stat(1, L"AMENAZAS BLOQUEADAS", std::to_wstring(g.threatsBlocked), L"Detectadas en total: " + std::to_wstring(g.threatsDetected), C_BAD, NAV_QUARANTINE);
+    stat(2, L"FIRMAS DE AMENAZAS", std::to_wstring(g.sigCount), L"Actualizado: " + g.lastUpdateText, C_VIOLET, NAV_UPDATE);
+
+    // ---- Actividad en vivo y gráfico de detecciones
+    y += sh + S(16);
+    const int areaH = std::min<int>(S(230), body.bottom - y);
+    if (areaH < S(120)) return; // ventana muy baja: se omite esta franja
+
+    const int feedW = static_cast<int>(bw * 0.58);
+    const RECT feedR = R(body.left, y, body.left + feedW, y + areaH);
+    const RECT chartR = R(feedR.right + S(16), y, body.right, y + areaH);
+    glassPanel(feedR, S(16));
+    glassPanel(chartR, S(16));
+
+    text(hdc, L"ACTIVIDAD EN VIVO", R(feedR.left + S(18), feedR.top + S(12), feedR.right - S(12), feedR.top + S(32)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    if (g.feed.empty()) {
+        text(hdc, L"Sin actividad registrada todavia. Los analisis, detecciones y acciones aparecen aqui.",
+             R(feedR.left + S(18), feedR.top + S(44), feedR.right - S(18), feedR.bottom - S(10)), g.fBody, C_MUTED);
+    } else {
+        int ry = feedR.top + S(40);
+        const int maxRows = std::max(1, (feedR.bottom - ry - S(8)) / S(30));
+        int shown = 0;
+        for (const auto& e : g.feed) {
+            if (shown++ >= maxRows) break;
+            COLORREF dotColor = C_MUTED;
+            if (e.kind == "detection" || e.kind == "ransomware") dotColor = C_BAD;
+            else if (e.kind == "quarantine") dotColor = C_WARN;
+            else if (e.kind == "scan") dotColor = C_ACCENT;
+            else if (e.kind == "usb_repair") dotColor = C_OK;
+            Gdiplus::SolidBrush halo(gc(dotColor, 50));
+            g.gfx->FillEllipse(&halo, feedR.left + S(16), ry + S(6), S(16), S(16));
+            Gdiplus::SolidBrush dot(gc(dotColor));
+            g.gfx->FillEllipse(&dot, feedR.left + S(20), ry + S(10), S(8), S(8));
+            const std::wstring when = W(e.timestamp.size() >= 16 ? e.timestamp.substr(11, 5) : e.timestamp);
+            text(hdc, when, R(feedR.left + S(40), ry, feedR.left + S(90), ry + S(28)), g.fSmall, C_MUTED, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            const std::wstring msg = W(e.threat.empty() ? e.kind : e.threat) + (e.action.empty() ? L"" : L"  -  " + W(e.action));
+            text(hdc, msg, R(feedR.left + S(92), ry, feedR.right - S(14), ry + S(28)), g.fBody, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            ry += S(30);
+        }
+    }
+
+    text(hdc, L"DETECCIONES (7 DIAS)", R(chartR.left + S(18), chartR.top + S(12), chartR.right - S(12), chartR.top + S(32)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    {
+        int maxV = 1;
+        for (int v : g.chartCounts) maxV = std::max(maxV, v);
+        const int plotL = chartR.left + S(22), plotR = chartR.right - S(22);
+        const int plotTop = chartR.top + S(48), plotBottom = chartR.bottom - S(34);
+        const int slot = (plotR - plotL) / 7;
+        static const wchar_t kDay[7] = {L'D', L'L', L'M', L'X', L'J', L'V', L'S'};
+        const std::time_t nowT = std::time(nullptr);
+
+        Gdiplus::Pen axis(gc(C_BORDER), 1.0f);
+        g.gfx->DrawLine(&axis, plotL, plotBottom, plotR, plotBottom);
+        for (int i = 0; i < 7; ++i) {
+            const int bx = plotL + i * slot + slot / 4;
+            const int bwid = slot / 2;
+            const int v = g.chartCounts[i];
+            const int bh = v == 0 ? S(3) : std::max(S(6), (plotBottom - plotTop) * v / maxV);
+            const RECT bar = R(bx, plotBottom - bh, bx + bwid, plotBottom);
+            Gdiplus::GraphicsPath p;
+            addRoundPath(p, bar, std::min(S(4), bwid / 2));
+            if (v == 0) {
+                Gdiplus::SolidBrush empty(gc(C_BORDER));
+                g.gfx->FillPath(&empty, &p);
+            } else {
+                Gdiplus::LinearGradientBrush br(Gdiplus::PointF(0.0f, static_cast<float>(bar.top)), Gdiplus::PointF(0.0f, static_cast<float>(bar.bottom)),
+                                                gc(C_ACCENT), gc(C_VIOLET));
+                g.gfx->FillPath(&br, &p);
+                text(hdc, std::to_wstring(v), R(bx - S(8), bar.top - S(20), bx + bwid + S(8), bar.top - S(2)), g.fSmall, C_TEXT, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            std::tm tmDay{};
+            const std::time_t dayT = nowT - static_cast<std::time_t>(6 - i) * 86400;
+            localtime_s(&tmDay, &dayT);
+            const std::wstring lbl(1, kDay[tmDay.tm_wday % 7]);
+            text(hdc, lbl, R(bx - S(6), plotBottom + S(6), bx + bwid + S(6), plotBottom + S(26)), g.fSmall, i == 6 ? C_ACCENT : C_MUTED, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
     }
 }
 
@@ -1464,7 +1807,7 @@ void paintUpdate(HDC hdc, int w, int h) {
     COLORREF statusColor = C_MUTED;
     if (g.appInfo.available) {
         status = L"Nueva version disponible: " + W(g.appInfo.latestVersion);
-        statusColor = RGB(20, 110, 190);
+        statusColor = C_ACCENT;
     } else if (!g.appMsg.empty()) {
         status = g.appMsg;
         statusColor = g.appChecked ? C_OK : C_MUTED;
@@ -1532,9 +1875,8 @@ void paintSettings(HDC hdc, int w, int h) {
     g.settingsMaxScroll = std::max(0, contentH - viewH);
     g.settingsScroll = std::clamp(g.settingsScroll, 0, g.settingsMaxScroll);
 
-    // Zona desplazable: todo lo que se dibuja aquí se recorta a la vista
-    SaveDC(hdc);
-    IntersectClipRect(hdc, view.left, view.top, view.right, view.bottom);
+    // Zona desplazable: todo lo que se dibuja aquí se recorta a la vista (GDI y GDI+)
+    const ClipState clip = beginClip(hdc, view);
     g.clipOn = true;
     g.clipRect = view;
 
@@ -1589,7 +1931,7 @@ void paintSettings(HDC hdc, int w, int h) {
 
     // Indicador de desplazamiento
     g.clipOn = false;
-    RestoreDC(hdc, -1);
+    endClip(hdc, clip);
     if (g.settingsMaxScroll > 0) {
         const int trackH = viewH;
         const int thumbH = std::max(S(40), trackH * viewH / contentH);
@@ -1692,8 +2034,27 @@ void paintExclusions(HDC hdc, int w, int h) {
     drawButton(hdc, R(body.right - S(140), by, body.right, by + S(40)), L"Volver", ID_EXCL_BACK, BS_SECONDARY);
 }
 
+/// Notificaciones flotantes (esquina inferior derecha).
+void paintToasts(HDC hdc, int w, int h) {
+    const ULONGLONG now = GetTickCount64();
+    g.toasts.erase(std::remove_if(g.toasts.begin(), g.toasts.end(), [now](const Toast& t) { return t.expire <= now; }), g.toasts.end());
+
+    int y = h - S(28);
+    for (auto it = g.toasts.rbegin(); it != g.toasts.rend(); ++it) {
+        const int tw = S(340), th = S(58);
+        const RECT rc = R(w - S(28) - tw, y - th, w - S(28), y);
+        glowRound(rc, S(14), it->color, 3, 70);
+        glassPanel(rc, S(14), it->color, 200);
+        Gdiplus::SolidBrush bar(gc(it->color));
+        g.gfx->FillRectangle(&bar, static_cast<int>(rc.left) + S(1), static_cast<int>(rc.top) + S(12), S(4), th - S(24));
+        text(hdc, it->text, R(rc.left + S(18), rc.top + S(6), rc.right - S(14), rc.bottom - S(6)), g.fBody, C_TEXT, DT_LEFT | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+        y -= th + S(10);
+    }
+}
+
 void paintAll(HDC hdc, int w, int h) {
     g.hits.clear();
+    SetRectEmpty(&g.animRect);
     SetBkMode(hdc, TRANSPARENT);
     fillRect(hdc, R(0, 0, w, h), C_BG);
     paintSidebar(hdc, h);
@@ -1708,9 +2069,8 @@ void paintAll(HDC hdc, int w, int h) {
         case PG_SCHEDULE:   paintSchedule(hdc, w, h); break;
         default: break;
     }
+    paintToasts(hdc, w, h);
 }
-
-// ----------------------------------------------------------------------------- eventos
 
 void restartProtectionIfRunning() {
     if (queryService() != Svc::Running) return;
@@ -1920,32 +2280,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             g.main = hwnd;
-            g.fH1 = makeFont(26, FW_SEMIBOLD);
-            g.fH2 = makeFont(16, FW_SEMIBOLD);
-            g.fBig = makeFont(30, FW_SEMIBOLD);
+            g.fH1 = makeFont(28, FW_SEMIBOLD, L"Bahnschrift"); // tipografía técnica de Windows 10/11
+            g.fH2 = makeFont(17, FW_SEMIBOLD, L"Bahnschrift");
+            g.fBig = makeFont(34, FW_SEMIBOLD, L"Bahnschrift");
             g.fBody = makeFont(14, FW_NORMAL);
             g.fBold = makeFont(14, FW_SEMIBOLD);
             g.fSmall = makeFont(12, FW_NORMAL);
             g.fIcon = makeFont(18, FW_NORMAL, L"Segoe MDL2 Assets");
             g.icon = static_cast<HICON>(LoadImageW(g.hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, S(48), S(48), LR_DEFAULTCOLOR));
 
-            g.list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            g.list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                                      WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
                                      0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LIST)), g.hInst, nullptr);
             ListView_SetExtendedListViewStyle(g.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             SendMessageW(g.list, WM_SETFONT, reinterpret_cast<WPARAM>(g.fBody), TRUE);
+            ListView_SetBkColor(g.list, C_CARD);
+            ListView_SetTextBkColor(g.list, C_CARD);
+            ListView_SetTextColor(g.list, C_TEXT);
+            SetWindowTheme(g.list, L"DarkMode_Explorer", nullptr); // barras de desplazamiento y selección oscuras
+            SetWindowTheme(ListView_GetHeader(g.list), L"DarkMode_ItemsView", nullptr);
+
 
             g.progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | PBS_MARQUEE, 0, 0, 10, 10, hwnd,
                                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROGRESS)), g.hInst, nullptr);
 
+            SetWindowTheme(g.progress, L"", L""); // sin tema: permite colorear la barra
+            SendMessageW(g.progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
+            SendMessageW(g.progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(RGB(30, 38, 58)));
+
             loadSettings();
-            g.history = std::make_unique<openguard::ThreatHistory>(openguard::paths::dataDir() / "history.db");
+            g.history = std::make_unique
+<openguard::ThreatHistory>(openguard::paths::dataDir() / "history.db");
             refreshData();
             loadYaraCount();
             layoutControls();
             addTrayIcon();
             SetTimer(hwnd, TIMER_REFRESH, 5000, nullptr);
             SetTimer(hwnd, TIMER_LOGPOLL, 5000, nullptr);
+            SetTimer(hwnd, TIMER_ANIM, 40, nullptr); // animación del anillo de estado (~25 fps)
             SetTimer(hwnd, TIMER_APPCHECK, 6 * 60 * 60 * 1000, nullptr); // revisa nuevas versiones cada 6 horas
             if (g.settings.checkAppUpdates) startAppCheck(true);
             return 0;
@@ -1962,11 +2334,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             const int w = rc.right, h = rc.bottom;
+            const RECT pr = ps.rcPaint;
             HDC mem = CreateCompatibleDC(hdc);
             HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
             HGDIOBJ old = SelectObject(mem, bmp);
-            paintAll(mem, w, h);
-            BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+            IntersectClipRect(mem, pr.left, pr.top, pr.right, pr.bottom); // la animación solo repinta su zona
+            {
+                Gdiplus::Graphics gfx(mem);
+                gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                gfx.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+                gfx.SetClip(Gdiplus::Rect(pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top));
+                g.gfx = &gfx;
+                paintAll(mem, w, h);
+                gfx.Flush(Gdiplus::FlushIntentionSync);
+                g.gfx = nullptr;
+            }
+            BitBlt(hdc, pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top, mem, pr.left, pr.top, SRCCOPY);
             SelectObject(mem, old);
             DeleteObject(bmp);
             DeleteDC(mem);
@@ -2002,7 +2385,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER:
+            if (wp == TIMER_ANIM) {
+                if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return 0; // oculto en la bandeja: sin gasto de CPU
+                g.animPhase += 0.012;
+                if (g.animPhase >= 1.0) g.animPhase -= 1.0;
+                if (!IsRectEmpty(&g.animRect)) InvalidateRect(hwnd, &g.animRect, FALSE);
+                if (!g.toasts.empty()) InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (wp == TIMER_LOGPOLL) { pollServiceLog(); return 0; }
+
             if (wp == TIMER_APPCHECK) { if (g.settings.checkAppUpdates) startAppCheck(true); return 0; }
             if (wp == TIMER_REFRESH && !g.scanning) { refreshData(); InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
@@ -2103,6 +2495,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
+    Gdiplus::GdiplusStartupInput gdiplusInput;
+    Gdiplus::GdiplusStartup(&g.gdiplusToken, &gdiplusInput, nullptr);
+
     // Instancia única: el servicio también usa este objeto para saber si la aplicación está abierta (preguntará ella
     // al conectar una unidad). Si ya hay otra, se le pide que muestre su ventana y esta termina.
     g.instanceMutex = CreateMutexW(nullptr, FALSE, L"Global\\OpenGuardGuiRunning");
@@ -2150,6 +2545,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         DispatchMessageW(&m);
     }
     if (g.instanceMutex) CloseHandle(g.instanceMutex);
+    Gdiplus::GdiplusShutdown(g.gdiplusToken);
     OleUninitialize();
     return static_cast<int>(m.wParam);
 }

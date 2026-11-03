@@ -15,6 +15,8 @@ target_link_libraries(openguard_gui PRIVATE
     user32
     gdi32
     msimg32
+    gdiplus
+    uxtheme
 )
 
 # El manifiesto (Common Controls 6, administrador, DPI) va incrustado en el .rc
