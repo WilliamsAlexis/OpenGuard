@@ -95,6 +95,10 @@ std::filesystem::path databasePath() {
     return dataDir() / "hashes.db";
 }
 
+std::filesystem::path rulesUpdateDir() {
+    return dataDir() / "rules";
+}
+
 std::filesystem::path quarantineDir() {
     return dataDir() / "quarantine";
 }

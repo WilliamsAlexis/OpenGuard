@@ -12,6 +12,7 @@
  */
 
 #include "openguard/crypto_utils.h"
+#include "openguard/feeds.h"
 #include "openguard/history.h"
 #include "openguard/isolated_scan.h"
 #include "openguard/settings.h"
@@ -133,6 +134,7 @@ public:
         cfg.excludedPaths.push_back(openguard::paths::executableDir());
         cfg.excludedPaths.push_back(openguard::paths::signaturesDir());
         cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
+        cfg.yaraUpdatesDir = openguard::paths::rulesUpdateDir();
 
         // Análisis de contenido en un proceso aislado (token restringido, integridad baja, Job Object).
         // Si el trabajador no está disponible o no puede iniciarse, se usa el análisis en proceso como respaldo.
@@ -190,6 +192,7 @@ public:
 
     void stop() {
         if (m_schedScanner) m_schedScanner->cancelScan(); // un análisis programado en curso se interrumpe
+        if (m_updateThread.joinable()) m_updateThread.join();
         if (m_scheduleThread.joinable()) m_scheduleThread.join();
         m_monitor.stop();
         removeDecoys();
@@ -204,6 +207,7 @@ public:
     void poll() {
         checkDecoys();
         checkSchedule();
+        checkFeeds();
         if (m_isolated && m_isolated->degraded() && !m_degradedLogged) {
             m_degradedLogged = true;
             g_log.write("WARN", "Analisis aislado en modo degradado: no se pudo aplicar el token restringido (solo Job Object)");
@@ -391,6 +395,74 @@ private:
             m_scheduleRunning = false;
         });
     }
+
+    // ----------------------------------------------------------------- actualización automática de firmas y reglas
+
+    std::time_t readFeedStamp(const wchar_t* key) const {
+        wchar_t buf[64]{};
+        GetPrivateProfileStringW(L"feeds", key, L"", buf, 64, statusIniPath().c_str());
+        const std::wstring w(buf);
+        return openguard::parseLocalStamp(std::string(w.begin(), w.end()));
+    }
+
+    void writeFeedStamp(const wchar_t* key, std::time_t t) const {
+        const std::string s = openguard::formatLocalStamp(t);
+        const std::wstring w(s.begin(), s.end());
+        WritePrivateProfileStringW(L"feeds", key, w.c_str(), statusIniPath().c_str());
+    }
+
+    /// Cada updateHours horas (o al arrancar, si nunca se hizo) se comprueban las fuentes habilitadas.
+    void checkFeeds() {
+        if (!m_set.autoUpdate || m_updateRunning || !m_db || m_db->isReadOnly()) return;
+
+        const std::time_t now = std::time(nullptr);
+        const std::time_t last = readFeedStamp(L"last_run");
+        if (last != 0 && now - last < static_cast<std::time_t>(m_set.updateHours) * 3600) return;
+        startFeedUpdate(now);
+    }
+
+    void startFeedUpdate(std::time_t now) {
+        if (m_updateThread.joinable()) m_updateThread.join();
+        m_updateRunning = true;
+        writeFeedStamp(L"last_run", now); // se anota ya: evita relanzar mientras corre
+
+        m_updateThread = std::thread([this, now]() {
+            try {
+                openguard::FeedOptions options;
+                options.official = true;
+                options.rules = m_set.feedRules;
+                options.bazaar = m_set.feedBazaar;
+                options.rulesDir = openguard::paths::rulesUpdateDir();
+                const openguard::SecretStore secrets;
+
+                const auto results = openguard::updateFeeds(*m_db, options, secrets);
+                bool anyOk = false;
+                for (const auto& r : results) {
+                    anyOk = anyOk || r.ok;
+                    const std::string what = r.feed == "rules" ? " reglas" : " firmas";
+                    if (r.ok) {
+                        g_log.write("INFO", "Actualizacion [" + r.feed + "]: " + std::to_string(r.inserted) + what + " nuevas" +
+                                                (r.signatureVerified ? " (firma verificada)" : ""));
+                        hist("update", "INFO", {}, "Actualizacion " + r.feed, "completada", {},
+                             std::to_string(r.inserted) + what + (r.signatureVerified ? ", firma verificada" : ""));
+                    } else {
+                        g_log.write("WARN", "Actualizacion [" + r.feed + "] fallo: " + r.error);
+                        hist("update", "WARN", {}, "Actualizacion " + r.feed, "fallo", {}, r.error);
+                    }
+                }
+                // Si todo falló (p. ej. sin red al arrancar) se reintenta en 15 minutos en vez de esperar todo el intervalo
+                if (!anyOk && !results.empty()) {
+                    writeFeedStamp(L"last_run", now - static_cast<std::time_t>(m_set.updateHours) * 3600 + 900);
+                }
+            } catch (const std::exception& e) {
+                g_log.write("ERROR", std::string("Actualizacion fallo: ") + e.what());
+            }
+            m_updateRunning = false;
+        });
+    }
+
+    std::thread m_updateThread;
+    std::atomic<bool> m_updateRunning{false};
 
     std::thread m_scheduleThread;
     std::shared_ptr<openguard::FileScanner> m_schedScanner;

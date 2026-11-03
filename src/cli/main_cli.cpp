@@ -141,6 +141,7 @@ openguard::ScannerConfig makeScannerConfig() {
     cfg.excludedPaths.push_back(openguard::paths::executableDir());
     cfg.excludedPaths.push_back(openguard::paths::signaturesDir());
     cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
+    cfg.yaraUpdatesDir = openguard::paths::rulesUpdateDir();
     const auto prot = openguard::ProtectionSettings::load(); // límite de CPU y exclusiones del usuario
     cfg.threadCount = prot.threadCount();
     for (const auto& ex : prot.exclusions) cfg.excludedPaths.push_back(ex);

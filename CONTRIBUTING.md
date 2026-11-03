@@ -4,6 +4,16 @@
 
 ---
 
+## Firmar actualizaciones (mantenedores)
+
+Si modifica `signatures/hashes_index.json` o cualquier regla de `signatures/yara_rules/`, **debe volver a firmar** antes de hacer commit:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\sign_release_files.ps1
+```
+
+El script regenera `signatures/rules_manifest.json` y los archivos `.sig`. La clave privada vive en `%USERPROFILE%\.openguard-signing\private.blob` (fuera del repositorio; haga copia de seguridad y no la comparta). Una prueba del CI (`ShippedSignedFilesVerifyWithOfficialKey`) falla si los archivos firmados no coinciden con su firma.
+
 ## 1. Principios de Seguridad del Código
 
 OpenGuard es una herramienta de ciberseguridad; por lo tanto, la seguridad de la memoria y la robustez contra vulnerabilidades son la máxima prioridad:

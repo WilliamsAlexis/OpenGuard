@@ -35,6 +35,9 @@ namespace openguard::paths {
 /// Directorio de la bóveda de cuarentena.
 [[nodiscard]] std::filesystem::path quarantineDir();
 
+/// Reglas YARA descargadas por la actualización (tienen prioridad sobre las de la instalación con el mismo nombre).
+[[nodiscard]] std::filesystem::path rulesUpdateDir();
+
 /// Directorio de registros (se crea si no existe).
 [[nodiscard]] std::filesystem::path logsDir();
 

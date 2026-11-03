@@ -25,7 +25,12 @@ OpenGuard es un proyecto de código abierto y gratuito diseñado con el principi
 
 ## 2. Descargas de Actualizaciones
 
-Las descargas ocurren **únicamente cuando el usuario ejecuta `openguard_cli update --online [url]`** (nunca en segundo plano). Solo se aceptan URLs `https://`; por defecto la del repositorio oficial. Si el usuario indica otra URL o una clave `--auth-key`, esa petición va al servidor que él elija.
+Las descargas de actualizaciones son de dos tipos:
+- **Manuales**: `openguard_cli update --online [url]` y los botones de actualización de la aplicación.
+- **Automáticas (activadas por defecto, se pueden desactivar en Configuración > Actualización > Fuentes automáticas)**: el servicio consulta cada 6 horas (configurable) el índice de firmas y las reglas YARA del repositorio oficial en GitHub (`raw.githubusercontent.com`). Todo lo descargado se verifica con una **firma digital ECDSA P-256**; si no es válida, se descarta. Opcionalmente, si el usuario lo activa y guarda su propia clave, consulta MalwareBazaar (abuse.ch). La clave se guarda cifrada con DPAPI y solo se envía a abuse.ch en el encabezado `Auth-Key`.
+En ningún caso se envían archivos, hashes de su equipo ni identificadores: solo peticiones GET.
+
+Las descargas manuales ocurren cuando el usuario ejecuta `openguard_cli update --online [url]`. Solo se aceptan URLs `https://`; por defecto la del repositorio oficial. Si el usuario indica otra URL o una clave `--auth-key`, esa petición va al servidor que él elija.
 
 Cuando OpenGuard consulta actualizaciones de firmas o reglas YARA:
 - La conexión se realiza directamente mediante peticiones HTTPS hacia el repositorio público oficial en GitHub (`https://raw.githubusercontent.com/WilliamsAlexis/OpenGuard`).

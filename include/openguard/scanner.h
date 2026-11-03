@@ -52,6 +52,7 @@ struct ScannerConfig {
     bool keepCleanResults{false};               ///< Conservar en la sesión también los archivos limpios (consume memoria en escaneos grandes).
     std::vector<std::filesystem::path> excludedPaths; ///< Directorios que se omiten en escaneos recursivos (ej: la cuarentena).
     std::filesystem::path yaraRulesDir;         ///< Carpeta con reglas *.yar (vacía = motor YARA desactivado).
+    std::filesystem::path yaraUpdatesDir;       ///< Reglas descargadas: reemplazan a las de yaraRulesDir con el mismo nombre.
     /// Si se define, scanFile() delega en este analizador (p. ej. el proceso aislado del servicio).
     std::function<ScanResult(const std::filesystem::path&)> customAnalyzer;
     /// true: se enumeran todos los archivos antes de analizar, de modo que el progreso tiene un total real

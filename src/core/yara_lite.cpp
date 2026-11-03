@@ -9,7 +9,9 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <cwctype>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <unordered_set>
@@ -594,6 +596,39 @@ size_t YaraLite::loadDirectory(const std::filesystem::path& dir) {
         if (!it->is_regular_file(e2)) continue;
         std::wstring ext = it->path().extension().wstring();
         if (ext == L".yar" || ext == L".yara") total += loadFile(it->path());
+    }
+    return total;
+}
+
+size_t YaraLite::loadDirectories(const std::filesystem::path& baseDir, const std::filesystem::path& overrideDir) {
+    auto lowerName = [](const std::filesystem::path& p) {
+        std::wstring n = p.filename().wstring();
+        for (auto& c : n) c = static_cast<wchar_t>(std::towlower(c));
+        return n;
+    };
+    size_t total = 0;
+    std::set<std::wstring> overridden;
+    std::error_code ec;
+
+    if (!overrideDir.empty() && std::filesystem::is_directory(overrideDir, ec)) {
+        for (std::filesystem::directory_iterator it(overrideDir, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code e2;
+            if (!it->is_regular_file(e2)) continue;
+            const std::wstring ext = it->path().extension().wstring();
+            if (ext != L".yar" && ext != L".yara") continue;
+            overridden.insert(lowerName(it->path()));
+            total += loadFile(it->path());
+        }
+    }
+    if (!baseDir.empty() && std::filesystem::is_directory(baseDir, ec)) {
+        for (std::filesystem::directory_iterator it(baseDir, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code e2;
+            if (!it->is_regular_file(e2)) continue;
+            const std::wstring ext = it->path().extension().wstring();
+            if (ext != L".yar" && ext != L".yara") continue;
+            if (overridden.count(lowerName(it->path()))) continue;
+            total += loadFile(it->path());
+        }
     }
     return total;
 }

@@ -49,6 +49,10 @@ ProtectionSettings ProtectionSettings::load(const std::filesystem::path& iniPath
     }
     s.scanDownloads = GetPrivateProfileIntW(L"service", L"scan_downloads", 1, f.c_str()) != 0;
     s.isolatedScan = GetPrivateProfileIntW(L"service", L"isolated_scan", 1, f.c_str()) != 0;
+    s.autoUpdate = GetPrivateProfileIntW(L"updates", L"auto", 1, f.c_str()) != 0;
+    s.updateHours = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"updates", L"hours", 6, f.c_str())), 1, 168);
+    s.feedRules = GetPrivateProfileIntW(L"updates", L"rules", 1, f.c_str()) != 0;
+    s.feedBazaar = GetPrivateProfileIntW(L"updates", L"bazaar", 0, f.c_str()) != 0;
     s.schedule.enabled = GetPrivateProfileIntW(L"schedule", L"enabled", 0, f.c_str()) != 0;
     {
         wchar_t buf[32]{};
@@ -100,6 +104,10 @@ bool ProtectionSettings::save(const std::filesystem::path& iniPath) const {
     put(L"service", L"usb_mode", std::wstring(mode.begin(), mode.end()));
     put(L"service", L"scan_downloads", scanDownloads ? L"1" : L"0");
     put(L"service", L"isolated_scan", isolatedScan ? L"1" : L"0");
+    put(L"updates", L"auto", autoUpdate ? L"1" : L"0");
+    put(L"updates", L"hours", std::to_wstring(std::clamp(updateHours, 1, 168)));
+    put(L"updates", L"rules", feedRules ? L"1" : L"0");
+    put(L"updates", L"bazaar", feedBazaar ? L"1" : L"0");
     put(L"schedule", L"enabled", schedule.enabled ? L"1" : L"0");
     put(L"schedule", L"type", schedule.type == "full" ? L"full" : L"quick");
     put(L"schedule", L"frequency", schedule.frequency == "weekly" ? L"weekly" : L"daily");

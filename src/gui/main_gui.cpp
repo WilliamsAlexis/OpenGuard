@@ -12,6 +12,8 @@
 #include "openguard/signatures.h"
 #include "openguard/app_update.h"
 #include "openguard/drive_tools.h"
+#include "openguard/feeds.h"
+#include "openguard/secrets.h"
 #include "openguard/history.h"
 #include "openguard/isolated_scan.h"
 #include "openguard/settings.h"
@@ -28,6 +30,7 @@
 #include <shlobj.h>
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <algorithm>
@@ -87,7 +90,7 @@ constexpr COLORREF C_SIDE_TEXT = RGB(150, 163, 190);
 
 // ----------------------------------------------------------------------------- ids y mensajes
 
-enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
+enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE, PG_FEEDS }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
@@ -101,7 +104,8 @@ enum : int {
     ID_SCHED_OPEN, ID_SCHED_BACK, ID_SCHED_SAVE, ID_SCHED_QUICK, ID_SCHED_FULL, ID_SCHED_DAILY, ID_SCHED_WEEKLY,
     ID_SCHED_HOUR_UP, ID_SCHED_HOUR_DOWN, ID_SCHED_MIN_UP, ID_SCHED_MIN_DOWN, ID_SCHED_DAY_NEXT,
     ID_USB_MODE,
-    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED, TOG_DOWNLOADS, TOG_TRAY, TOG_AUTOSTART
+    ID_FEEDS_OPEN, ID_FEEDS_BACK, ID_FEEDS_SAVE, ID_FEEDS_RUN, ID_FEED_HOURS, ID_FEED_KEY_PASTE, ID_FEED_KEY_REMOVE,
+    TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED, TOG_DOWNLOADS, TOG_TRAY, TOG_AUTOSTART, TOG_AUTOUPD, TOG_FEEDRULES, TOG_BAZAAR
 };
 
 constexpr UINT WM_APP_PROGRESS = WM_APP + 1;
@@ -109,7 +113,8 @@ constexpr UINT WM_APP_DONE = WM_APP + 2;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 4;
 constexpr UINT WM_APP_USB = WM_APP + 7;     // se conectó una unidad (wParam = letra)
-constexpr UINT WM_APP_SHOW = WM_APP + 8;    // otra instancia pide mostrar la ventana
+constexpr UINT WM_APP_SHOW = WM_APP + 8;
+constexpr UINT WM_APP_FEEDS_DONE = WM_APP + 9;    // otra instancia pide mostrar la ventana
 enum : int { ID_TRAY_OPEN = 400, ID_TRAY_QUICK, ID_TRAY_TOGGLE, ID_TRAY_EXIT };
 enum : int { ID_DRV_ISOLATE = 5001, ID_DRV_REPAIR, ID_DRV_DETAILS, ID_DRV_CLOSE, ID_DRV_SCAN, ID_DRV_LATER };
 constexpr UINT WM_APP_APPCHECK_DONE = WM_APP + 5;
@@ -166,6 +171,11 @@ struct AppState {
     openguard::ProtectionSettings prot;                  // configuración compartida con el servicio
     std::unique_ptr<openguard::ThreatHistory> history;   // historial estructurado
     bool scanTotalKnown{false};
+    // Fuentes de firmas
+    std::wstring feedMsg;
+    bool feedOk{true};
+    std::thread feedThread;
+    std::atomic<bool> feedBusy{false};
     // Unidades externas
     std::wstring driveRoot;                       // unidad en análisis (vacío si el análisis no es de una unidad)
     openguard::DriveInspection driveInspection;   // síntomas detectados en esa unidad
@@ -365,7 +375,7 @@ void refreshData() {
 
 void loadYaraCount() {
     openguard::YaraLite y;
-    y.loadDirectory(openguard::paths::signaturesDir() / "yara_rules");
+    y.loadDirectories(openguard::paths::signaturesDir() / "yara_rules", openguard::paths::rulesUpdateDir());
     g.yaraCount = y.ruleCount();
 }
 
@@ -375,6 +385,7 @@ openguard::ScannerConfig makeConfig() {
     for (const auto& ex : g.prot.exclusions) cfg.excludedPaths.push_back(ex);
     cfg.threadCount = g.prot.threadCount();   // límite de CPU elegido por el usuario
     cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
+    cfg.yaraUpdatesDir = openguard::paths::rulesUpdateDir();
 
     // La GUI corre elevada: analizar archivos hostiles en su propio proceso sería peor que en el servicio.
     // Los análisis manuales usan también el proceso trabajador aislado (con respaldo en proceso).
@@ -1027,6 +1038,7 @@ void showPage(Page p) {
     else if (p == PG_SETTINGS) { loadSettings(); g.settingsScroll = 0; }
     else if (p == PG_EXCLUSIONS) { loadSettings(); fillExclusionList(); }
     else if (p == PG_SCHEDULE) loadSettings();
+    else if (p == PG_FEEDS) loadSettings();
     layoutControls();
     InvalidateRect(g.main, nullptr, FALSE);
 }
@@ -1289,6 +1301,99 @@ void importFromFile() {
     InvalidateRect(g.main, nullptr, FALSE);
 }
 
+// ----------------------------------------------------------------------------- fuentes de firmas
+
+void startFeedUpdate() {
+    if (g.feedBusy.exchange(true)) return;
+    if (g.feedThread.joinable()) g.feedThread.join();
+    g.feedMsg = L"Actualizando fuentes (se verifica la firma digital de lo descargado)...";
+    g.feedOk = true;
+    InvalidateRect(g.main, nullptr, FALSE);
+
+    const openguard::ProtectionSettings prot = g.prot;
+    g.feedThread = std::thread([prot]() {
+        auto* results = new std::vector<openguard::FeedResult>();
+        try {
+            openguard::FeedOptions options;
+            options.official = true;
+            options.rules = prot.feedRules;
+            options.bazaar = prot.feedBazaar;
+            options.rulesDir = openguard::paths::rulesUpdateDir();
+            const openguard::SecretStore secrets;
+            *results = openguard::updateFeeds(*g.db, options, secrets);
+        } catch (const std::exception& e) {
+            openguard::FeedResult r;
+            r.feed = "error";
+            r.error = e.what();
+            results->push_back(r);
+        }
+        PostMessageW(g.main, WM_APP_FEEDS_DONE, 0, reinterpret_cast<LPARAM>(results));
+    });
+}
+
+void onFeedsDone(std::vector<openguard::FeedResult>* results) {
+    std::unique_ptr<std::vector<openguard::FeedResult>> owned(results);
+    if (g.feedThread.joinable()) g.feedThread.join();
+    g.feedBusy = false;
+
+    std::wstring msg;
+    bool allOk = true, anyOk = false;
+    for (const auto& r : *owned) {
+        const std::wstring name = r.feed == "official" ? L"Firmas oficiales" : r.feed == "rules" ? L"Reglas YARA" : r.feed == "bazaar" ? L"MalwareBazaar" : W(r.feed);
+        if (!msg.empty()) msg += L"\n";
+        if (r.ok) {
+            anyOk = true;
+            msg += name + L": " + std::to_wstring(r.inserted) + (r.feed == "rules" ? L" reglas actualizadas" : L" firmas nuevas") +
+                   (r.signatureVerified ? L" (firma verificada)" : L"");
+        } else {
+            allOk = false;
+            msg += name + L": " + W(r.error);
+        }
+    }
+    g.feedMsg = msg.empty() ? L"No hay fuentes habilitadas." : msg;
+    g.feedOk = allOk;
+    if (anyOk) {
+        iniSetStr(guiIni(), L"stats", L"last_update", nowText());
+        g.homeCacheTick = 0;
+        loadYaraCount();
+        refreshData();
+    }
+    pushToast(allOk ? L"Fuentes actualizadas" : L"Actualizacion con errores (ver detalle)", allOk ? C_OK : C_WARN);
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
+/// Guarda como clave de abuse.ch el texto del portapapeles (cifrado con DPAPI). Evita pedir texto en un cuadro propio.
+void pasteFeedKeyFromClipboard() {
+    std::string key;
+    if (OpenClipboard(g.main)) {
+        if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+            if (const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+                key = openguard::paths::toUtf8(fs::path(std::wstring(p)));
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+    }
+    const auto b = key.find_first_not_of(" \t\r\n");
+    const auto e = key.find_last_not_of(" \t\r\n");
+    key = (b == std::string::npos) ? std::string() : key.substr(b, e - b + 1);
+
+    const bool plausible = key.size() >= 16 && key.size() <= 200 &&
+                           std::all_of(key.begin(), key.end(), [](unsigned char c) { return std::isalnum(c) || c == '-' || c == '_'; });
+    if (!plausible) {
+        MessageBoxW(g.main, L"El portapapeles no contiene una clave valida de abuse.ch.\n\nCopie la clave (Auth-Key de su cuenta en abuse.ch) y pulse de nuevo el boton.",
+                    L"Clave de abuse.ch", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    openguard::SecretStore secrets;
+    if (secrets.set(openguard::kAbuseChSecret, key)) {
+        pushToast(L"Clave guardada cifrada con DPAPI", C_OK);
+    } else {
+        MessageBoxW(g.main, L"No se pudo guardar la clave (ejecute OpenGuard como Administrador).", L"Clave de abuse.ch", MB_OK | MB_ICONWARNING);
+    }
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
 // ----------------------------------------------------------------------------- actualización del programa
 
 void showBalloon(const std::wstring& title, const std::wstring& body, DWORD icon);
@@ -1500,7 +1605,8 @@ void paintSidebar(HDC hdc, int h) {
     int y = S(104);
     for (int i = 0; i < PG_COUNT; ++i) {
         RECT item = R(S(10), y, sw - S(10), y + S(46));
-        const bool sel = (g.page == i) || (i == PG_SETTINGS && (g.page == PG_EXCLUSIONS || g.page == PG_SCHEDULE));
+        const bool sel = (g.page == i) || (i == PG_SETTINGS && (g.page == PG_EXCLUSIONS || g.page == PG_SCHEDULE)) ||
+                          (i == PG_UPDATE && g.page == PG_FEEDS);
         const bool hot = isHot(NAV_BASE + i);
         if (sel || hot) {
             Gdiplus::GraphicsPath p;
@@ -1792,6 +1898,8 @@ void paintUpdate(HDC hdc, int w, int h) {
                g.updating ? L"Actualizando..." : L"Actualizar firmas", ID_UPDATE_NOW, BS_PRIMARY, !g.updating);
     drawButton(hdc, R(card.left + S(228), card.bottom - S(56), card.left + S(228) + S(210), card.bottom - S(16)),
                L"Importar desde archivo...", ID_IMPORT_FILE, BS_SECONDARY, !g.updating);
+    drawButton(hdc, R(card.left + S(450), card.bottom - S(56), card.left + S(450) + S(250), card.bottom - S(16)),
+               L"Fuentes automaticas...", ID_FEEDS_OPEN, BS_SECONDARY);
     if (!g.updateMsg.empty()) {
         text(hdc, g.updateMsg, R(body.left, card.bottom + S(8), body.right, card.bottom + S(32)), g.fBold, g.updateOk ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     }
@@ -2024,6 +2132,55 @@ void paintSchedule(HDC hdc, int w, int h) {
     drawButton(hdc, R(body.left + S(232), by, body.left + S(232) + S(140), by + S(40)), L"Volver", ID_SCHED_BACK, BS_SECONDARY);
 }
 
+void paintFeeds(HDC hdc, int w, int h) {
+    pageHeader(hdc, w, L"Fuentes de firmas", L"Actualizacion automatica con verificacion criptografica de lo descargado");
+    const RECT body = bodyRect(w, h);
+    const int by = bottomButtonsTop(h);
+
+    const int rowH = S(60);
+    RECT card = R(body.left, body.top, body.right, body.top + rowH * 5 + S(8));
+    drawCard(hdc, card);
+    int y = card.top + S(4);
+    const int right = card.right - S(20);
+
+    auto label = [&](int rowY, const wchar_t* title, const wchar_t* desc) {
+        text(hdc, title, R(card.left + S(22), rowY + S(8), card.right - S(260), rowY + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, desc, R(card.left + S(22), rowY + S(30), card.right - S(260), rowY + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    };
+    auto sep = [&](int rowY) { fillRect(hdc, R(card.left + S(20), rowY - 1, card.right - S(20), rowY), C_BORDER); };
+
+    label(y, L"Actualizacion automatica", L"El servicio comprueba las fuentes sin que usted haga nada.");
+    drawToggle(hdc, right - S(46), y + (rowH - S(24)) / 2, g.prot.autoUpdate, TOG_AUTOUPD);
+    y += rowH; sep(y);
+
+    label(y, L"Frecuencia", L"Cada cuanto tiempo se comprueban las fuentes.");
+    drawButton(hdc, R(right - S(190), y + S(10), right, y + S(10) + S(38)), L"Cada " + std::to_wstring(g.prot.updateHours) + (g.prot.updateHours == 1 ? L" hora" : L" horas"), ID_FEED_HOURS, BS_SECONDARY);
+    y += rowH; sep(y);
+
+    label(y, L"Reglas YARA oficiales (firmadas)", L"Se verifica la firma ECDSA del manifiesto y el hash de cada regla.");
+    drawToggle(hdc, right - S(46), y + (rowH - S(24)) / 2, g.prot.feedRules, TOG_FEEDRULES);
+    y += rowH; sep(y);
+
+    label(y, L"MalwareBazaar (abuse.ch)", L"Hashes de malware reciente. Requiere una clave gratuita de abuse.ch.");
+    drawToggle(hdc, right - S(46), y + (rowH - S(24)) / 2, g.prot.feedBazaar, TOG_BAZAAR);
+    y += rowH; sep(y);
+
+    const bool hasKey = openguard::SecretStore().has(openguard::kAbuseChSecret);
+    label(y, L"Clave de abuse.ch", hasKey ? L"Guardada y cifrada con DPAPI (no se muestra)." : L"No configurada. Copie su Auth-Key y pulse \"Pegar\".");
+    drawButton(hdc, R(right - S(250), y + S(10), right - S(110), y + S(10) + S(38)), L"Pegar", ID_FEED_KEY_PASTE, BS_PRIMARY);
+    drawButton(hdc, R(right - S(100), y + S(10), right, y + S(10) + S(38)), L"Quitar", ID_FEED_KEY_REMOVE, BS_SECONDARY, hasKey);
+
+    const std::wstring last = iniGetStr(openguard::paths::dataDir() / L"status.ini", L"feeds", L"last_run", L"Nunca");
+    text(hdc, L"Ultima comprobacion automatica: " + last, R(body.left, card.bottom + S(14), body.right, card.bottom + S(38)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    if (!g.feedMsg.empty()) {
+        text(hdc, g.feedMsg, R(body.left, card.bottom + S(42), body.right, by - S(10)), g.fBody, g.feedOk ? C_OK : C_WARN);
+    }
+
+    drawButton(hdc, R(body.left, by, body.left + S(200), by + S(40)), L"Guardar y aplicar", ID_FEEDS_SAVE, BS_PRIMARY);
+    drawButton(hdc, R(body.left + S(212), by, body.left + S(212) + S(200), by + S(40)), g.feedBusy ? L"Actualizando..." : L"Actualizar ahora", ID_FEEDS_RUN, BS_SECONDARY, !g.feedBusy);
+    drawButton(hdc, R(body.left + S(424), by, body.left + S(424) + S(130), by + S(40)), L"Volver", ID_FEEDS_BACK, BS_SECONDARY);
+}
+
 void paintExclusions(HDC hdc, int w, int h) {
     pageHeader(hdc, w, L"Exclusiones", L"Carpetas y archivos que OpenGuard no analizara (use con precaucion)");
     const RECT body = bodyRect(w, h);
@@ -2067,6 +2224,7 @@ void paintAll(HDC hdc, int w, int h) {
         case PG_SETTINGS:   paintSettings(hdc, w, h); break;
         case PG_EXCLUSIONS: paintExclusions(hdc, w, h); break;
         case PG_SCHEDULE:   paintSchedule(hdc, w, h); break;
+        case PG_FEEDS:      paintFeeds(hdc, w, h); break;
         default: break;
     }
     paintToasts(hdc, w, h);
@@ -2135,6 +2293,36 @@ void onHit(int id) {
         case ID_EXCL_OPEN: showPage(PG_EXCLUSIONS); break;
         case ID_EXCL_BACK: showPage(PG_SETTINGS); break;
         case ID_SCHED_OPEN: showPage(PG_SCHEDULE); break;
+        case ID_FEEDS_OPEN: showPage(PG_FEEDS); break;
+        case ID_FEEDS_BACK: showPage(PG_UPDATE); break;
+        case TOG_AUTOUPD: g.prot.autoUpdate = !g.prot.autoUpdate; break;
+        case TOG_FEEDRULES: g.prot.feedRules = !g.prot.feedRules; break;
+        case TOG_BAZAAR: g.prot.feedBazaar = !g.prot.feedBazaar; break;
+        case ID_FEED_HOURS: {
+            static const int kHours[] = {1, 6, 12, 24, 72, 168};
+            int next = kHours[0];
+            for (size_t i = 0; i < std::size(kHours); ++i) {
+                if (g.prot.updateHours == kHours[i]) { next = kHours[(i + 1) % std::size(kHours)]; break; }
+            }
+            g.prot.updateHours = next;
+            break;
+        }
+        case ID_FEED_KEY_PASTE: pasteFeedKeyFromClipboard(); break;
+        case ID_FEED_KEY_REMOVE:
+            if (MessageBoxW(g.main, L"Se eliminara la clave de abuse.ch guardada. Continuar?", L"Clave de abuse.ch", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                openguard::SecretStore().remove(openguard::kAbuseChSecret);
+            }
+            break;
+        case ID_FEEDS_RUN: startFeedUpdate(); break;
+        case ID_FEEDS_SAVE:
+            if (!g.prot.save()) {
+                MessageBoxW(g.main, L"No se pudo guardar (ejecute OpenGuard como Administrador).", L"OpenGuard", MB_OK | MB_ICONWARNING);
+            } else {
+                restartProtectionIfRunning();
+                pushToast(L"Configuracion de fuentes guardada", C_OK);
+            }
+            break;
+
         case ID_SCHED_BACK: showPage(PG_SETTINGS); break;
         case TOG_SCHED: g.prot.schedule.enabled = !g.prot.schedule.enabled; break;
         case ID_SCHED_QUICK: g.prot.schedule.type = "quick"; break;
@@ -2423,6 +2611,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_APPDL_DONE:
             onAppDownloadDone(reinterpret_cast<DownloadResult*>(lp));
             return 0;
+        case WM_APP_FEEDS_DONE:
+            onFeedsDone(reinterpret_cast<std::vector<openguard::FeedResult>*>(lp));
+            return 0;
         case WM_APP_UPDATE_DONE:
             onUpdateDone(reinterpret_cast<openguard::UpdateResult*>(lp));
             return 0;
@@ -2480,6 +2671,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g.worker.joinable()) g.worker.join();
             if (g.updater.joinable()) g.updater.join();
             if (g.appThread.joinable()) g.appThread.join();
+            if (g.feedThread.joinable()) g.feedThread.join();
             PostQuitMessage(0);
             return 0;
         default:

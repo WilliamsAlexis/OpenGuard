@@ -48,6 +48,11 @@ struct ProtectionSettings {
     std::string usbMode{"ask"};
     bool scanDownloads{true};      ///< Analizar automáticamente los archivos que se descargan (carpetas Descargas).
     bool isolatedScan{true};       ///< Analizar el contenido en un proceso aislado de bajo privilegio.
+    // Actualización automática de firmas y reglas
+    bool autoUpdate{true};         ///< Comprobar fuentes de forma periódica (servicio).
+    int updateHours{6};            ///< Intervalo entre comprobaciones (1-168).
+    bool feedRules{true};          ///< Reglas YARA oficiales (firmadas).
+    bool feedBazaar{false};        ///< MalwareBazaar (requiere clave de abuse.ch guardada en el SecretStore).
     ScanSchedule schedule;         ///< Análisis programado.
     int cpuPercent{50};            ///< Límite de CPU para análisis (10-100): fracción de núcleos usada.
     std::vector<std::filesystem::path> exclusions; ///< Carpetas o archivos que no se analizan.

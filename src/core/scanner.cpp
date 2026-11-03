@@ -42,7 +42,7 @@ FileScanner::FileScanner(std::shared_ptr<SignatureDB> sigDb, ScannerConfig confi
     m_heuristics = std::make_unique<HeuristicsEngine>();
     if (!m_config.yaraRulesDir.empty()) {
         m_yara = std::make_unique<YaraLite>();
-        m_yara->loadDirectory(m_config.yaraRulesDir);
+        m_yara->loadDirectories(m_config.yaraRulesDir, m_config.yaraUpdatesDir);
     }
 }
 

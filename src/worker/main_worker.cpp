@@ -127,7 +127,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
         // 2. Cargar reglas YARA (solo lectura) y reducir privilegios ANTES de procesar el contenido no confiable
         openguard::YaraLite yara;
-        yara.loadDirectory(openguard::paths::signaturesDir() / "yara_rules");
+        yara.loadDirectories(openguard::paths::signaturesDir() / "yara_rules", openguard::paths::rulesUpdateDir());
 
         selfSandbox();
 

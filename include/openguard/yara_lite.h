@@ -46,6 +46,9 @@ public:
     /// Carga todas las reglas *.yar de un directorio. @return reglas cargadas.
     size_t loadDirectory(const std::filesystem::path& dir);
 
+    /// Carga las reglas de baseDir y de overrideDir; si un archivo existe en ambas, solo vale el de overrideDir.
+    size_t loadDirectories(const std::filesystem::path& baseDir, const std::filesystem::path& overrideDir);
+
     /// Carga las reglas de un archivo. @return reglas cargadas.
     size_t loadFile(const std::filesystem::path& file);
 

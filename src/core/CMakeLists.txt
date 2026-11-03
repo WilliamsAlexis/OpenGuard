@@ -24,6 +24,9 @@ add_library(openguard_core STATIC
     history.cpp
     office_macros.cpp
     drive_tools.cpp
+    update_verify.cpp
+    secrets.cpp
+    feeds.cpp
 )
 
 target_include_directories(openguard_core PUBLIC
