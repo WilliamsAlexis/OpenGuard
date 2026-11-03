@@ -75,6 +75,7 @@ enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS,
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
+    NAV_UPDATE = NAV_BASE + 2, NAV_QUARANTINE = NAV_BASE + 3,  // = NAV_BASE + PG_UPDATE / PG_QUARANTINE
     ID_SCAN_QUICK = 200, ID_SCAN_FULL, ID_SCAN_FOLDER, ID_CANCEL, ID_ISOLATE,
     ID_UPDATE_NOW, ID_IMPORT_FILE, ID_Q_RESTORE, ID_Q_DELETE, ID_Q_REFRESH,
     ID_LOG_OPEN, ID_LOG_REFRESH, ID_TOGGLE_PROTECTION, ID_SAVE_SETTINGS, ID_FIX,
@@ -1055,7 +1056,7 @@ void paintHome(HDC hdc, int w, int h) {
         roundRect(hdc, strip, S(10), RGB(228, 240, 252), RGB(150, 190, 230), true);
         text(hdc, L"Nueva version disponible: OpenGuard " + W(g.appInfo.latestVersion),
              R(strip.left + S(18), strip.top, strip.right - S(200), strip.bottom), g.fBold, RGB(20, 70, 130), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        drawButton(hdc, R(strip.right - S(180), strip.top + S(7), strip.right - S(10), strip.bottom - S(7)), L"Ver actualizacion", NAV_BASE + PG_UPDATE, BS_PRIMARY);
+        drawButton(hdc, R(strip.right - S(180), strip.top + S(7), strip.right - S(10), strip.bottom - S(7)), L"Ver actualizacion", NAV_UPDATE, BS_PRIMARY);
         extra = S(58);
     }
 
@@ -1069,9 +1070,9 @@ void paintHome(HDC hdc, int w, int h) {
     drawCardButton(hdc, R(body.left + (cw + gap), ctop, body.left + (cw + gap) + cw, ctop + ch), L"Analisis completo",
                    L"Todas las unidades fijas del equipo", ID_SCAN_FULL, !g.scanning);
     drawCardButton(hdc, R(body.left + 2 * (cw + gap), ctop, body.left + 2 * (cw + gap) + cw, ctop + ch), L"Actualizacion",
-                   std::to_wstring(g.sigCount) + L" firmas y " + std::to_wstring(g.yaraCount) + L" reglas YARA", NAV_BASE + PG_UPDATE);
+                   std::to_wstring(g.sigCount) + L" firmas y " + std::to_wstring(g.yaraCount) + L" reglas YARA", NAV_UPDATE);
     drawCardButton(hdc, R(body.left + 3 * (cw + gap), ctop, body.left + 3 * (cw + gap) + cw, ctop + ch), L"Cuarentena",
-                   std::to_wstring(g.quarantineCount) + L" elementos aislados", NAV_BASE + PG_QUARANTINE);
+                   std::to_wstring(g.quarantineCount) + L" elementos aislados", NAV_QUARANTINE);
 
     // Resumen
     RECT info = R(body.left, ctop + ch + S(22), body.right, std::min<int>(body.bottom, ctop + ch + S(22) + S(150)));
@@ -1089,7 +1090,7 @@ void paintHome(HDC hdc, int w, int h) {
         {L"Motor", W(std::string("OpenGuard ") + OPENGUARD_VERSION) + L"  |  Firmas + YARA + Heuristica PE/Scripts"},
     };
     int ry = info.top + S(16);
-    const int maxRows = std::max(1, (info.bottom - info.top - S(20)) / S(30));
+    const int maxRows = std::max<int>(1, (info.bottom - info.top - S(20)) / S(30));
     int shown = 0;
     for (const auto& row : rows) {
         if (shown++ >= maxRows) break;
@@ -1281,7 +1282,7 @@ void restartProtectionIfRunning() {
 }
 
 void onHit(int id) {
-    if (id >= NAV_BASE && id < NAV_BASE + PG_COUNT) { showPage(static_cast<Page>(id - NAV_BASE)); return; }
+    if (id >= NAV_BASE && id < static_cast<int>(NAV_BASE) + static_cast<int>(PG_COUNT)) { showPage(static_cast<Page>(id - NAV_BASE)); return; }
 
     switch (id) {
         case ID_SCAN_QUICK: startScan(quickTargets(), openguard::ScanType::Quick); break;
