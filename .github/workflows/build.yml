@@ -31,7 +31,7 @@ jobs:
 
       - name: Compilar binarios (Release)
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --config Release -- /m /v:normal
 
       - name: Ejecutar pruebas unitarias automatizadas (Google Test)
         run: |

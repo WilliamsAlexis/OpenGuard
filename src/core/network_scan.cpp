@@ -7,15 +7,16 @@
 
 #include "openguard/network_scan.h"
 
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <iphlpapi.h>
 #include <psapi.h>
 
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
+#include <algorithm>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -250,4 +251,3 @@ void NetworkScanner::checkProxySettings(NetworkScanReport& report) {
 }
 
 } // namespace openguard
-

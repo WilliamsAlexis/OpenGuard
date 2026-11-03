@@ -16,6 +16,7 @@
 #include <future>
 #include <atomic>
 #include <memory>
+#include <tuple>
 
 namespace openguard {
 
@@ -54,8 +55,8 @@ public:
         using ReturnType = typename std::invoke_result<F, Args...>::type;
 
         auto task = std::make_shared<std::packaged_task<ReturnType()>>(
-            [func = std::forward<F>(f), ...captureArgs = std::forward<Args>(args)]() mutable {
-                return std::invoke(std::move(func), std::move(captureArgs)...);
+            [func = std::forward<F>(f), argsTuple = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+                return std::apply(std::move(func), std::move(argsTuple));
             }
         );
 
@@ -91,4 +92,3 @@ private:
 };
 
 } // namespace openguard
-
