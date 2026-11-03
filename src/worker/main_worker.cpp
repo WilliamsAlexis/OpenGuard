@@ -4,7 +4,9 @@
  * @details Lo lanza IsolatedScanner con token restringido, integridad baja y dentro de un Job Object.
  *          Recibe un HANDLE de solo lectura heredado (--handle), por lo que no necesita acceso al sistema
  *          de archivos. No abre bases de datos ni verifica firmas: solo hashes, YARA y estructura del contenido.
- *          Códigos de salida: 0 = correcto, 2 = argumentos, 3 = error de lectura/memoria.
+ *
+ *          Siempre responde con JSON, incluso ante un error (campo "error"), para que el servicio pueda
+ *          diagnosticar. Códigos de salida: 0 = análisis correcto, 2 = argumentos, 3 = error controlado.
  */
 
 #include "openguard/content_analysis.h"
@@ -14,9 +16,9 @@
 #include <windows.h>
 #include <sddl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -36,11 +38,20 @@ bool writeAll(HANDLE out, const std::string& s) {
     return true;
 }
 
-/// Reduce los privilegios del propio proceso ANTES de tocar datos no confiables. Funciona aunque el servicio
+/// Responde con un error estructurado y devuelve el código de salida 3.
+int fail(HANDLE out, const std::string& message) {
+    openguard::ContentAnalysis a;
+    a.ok = false;
+    a.error = message;
+    if (out && out != INVALID_HANDLE_VALUE) writeAll(out, openguard::contentAnalysisToJson(a));
+    return 3;
+}
+
+/// Reduce los privilegios del propio proceso ANTES de analizar datos no confiables. Funciona aunque el servicio
 /// no haya podido crear un token restringido (modo degradado, p. ej. cuando lo lanza una GUI elevada):
 ///  - integridad BAJA (no puede escribir en objetos de nivel medio/alto),
 ///  - todos los privilegios eliminados de forma permanente,
-///  - sin creación de procesos hijos, sin código dinámico (JIT/shellcode) y sin imágenes remotas.
+///  - sin creación de procesos hijos.
 /// Los fallos se ignoran a propósito: son capas adicionales y el Job Object del llamador sigue aplicando.
 void selfSandbox() {
     HANDLE token = nullptr;
@@ -70,15 +81,6 @@ void selfSandbox() {
     PROCESS_MITIGATION_CHILD_PROCESS_POLICY child{};
     child.NoChildProcessCreation = 1;
     SetProcessMitigationPolicy(ProcessChildProcessPolicy, &child, sizeof(child));
-
-    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dyn{};
-    dyn.ProhibitDynamicCode = 1;
-    SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dyn, sizeof(dyn));
-
-    PROCESS_MITIGATION_IMAGE_LOAD_POLICY img{};
-    img.NoRemoteImages = 1;
-    img.NoLowMandatoryLabelImages = 1;
-    SetProcessMitigationPolicy(ProcessImageLoadPolicy, &img, sizeof(img));
 }
 
 } // namespace
@@ -96,44 +98,47 @@ int wmain(int argc, wchar_t* argv[]) {
             for (wchar_t c : val) ext.push_back(c < 0x80 ? static_cast<char>(c) : '?');
         }
     }
-    if (!hFile || hFile == INVALID_HANDLE_VALUE) return 2;
-
-    selfSandbox(); // a partir de aquí el proceso ya no puede escribir fuera de la tubería heredada
 
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!hFile || hFile == INVALID_HANDLE_VALUE) {
+        fail(out, "argumento --handle invalido");
+        return 2;
+    }
     if (!out || out == INVALID_HANDLE_VALUE) return 2;
 
-    // Leer todo el contenido desde el handle heredado
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(hFile, &size) || size.QuadPart < 0 || static_cast<uint64_t>(size.QuadPart) > kMaxBytes) return 3;
-
-    std::vector<uint8_t> data;
     try {
-        data.resize(static_cast<size_t>(size.QuadPart));
-    } catch (...) {
-        return 3;
-    }
-    size_t done = 0;
-    while (done < data.size()) {
-        DWORD got = 0;
-        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - done, 16u * 1024u * 1024u));
-        if (!ReadFile(hFile, data.data() + done, chunk, &got, nullptr) || got == 0) return 3;
-        done += got;
-    }
+        // 1. Leer el contenido desde el handle heredado (antes de reducir privilegios, para no depender de él después)
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(hFile, &size) || size.QuadPart < 0) {
+            return fail(out, "GetFileSizeEx fallo (codigo " + std::to_string(GetLastError()) + ")");
+        }
+        if (static_cast<uint64_t>(size.QuadPart) > kMaxBytes) return fail(out, "archivo demasiado grande");
 
-    // Reglas YARA (solo lectura desde la carpeta de instalación)
-    openguard::YaraLite yara;
-    yara.loadDirectory(openguard::paths::signaturesDir() / "yara_rules");
+        std::vector<uint8_t> data(static_cast<size_t>(size.QuadPart));
+        size_t done = 0;
+        while (done < data.size()) {
+            DWORD got = 0;
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - done, 16u * 1024u * 1024u));
+            if (!ReadFile(hFile, data.data() + done, chunk, &got, nullptr) || got == 0) {
+                return fail(out, "ReadFile fallo (codigo " + std::to_string(GetLastError()) + ")");
+            }
+            done += got;
+        }
 
-    // La extensión determina el tipo de análisis; la ruta real no se pasa al trabajador
-    const std::filesystem::path pseudoPath(std::string("archivo") + ext);
-    openguard::ContentAnalysis analysis;
-    try {
-        analysis = openguard::analyzeContent(data, pseudoPath, &yara);
+        // 2. Cargar reglas YARA (solo lectura) y reducir privilegios ANTES de procesar el contenido no confiable
+        openguard::YaraLite yara;
+        yara.loadDirectory(openguard::paths::signaturesDir() / "yara_rules");
+
+        selfSandbox();
+
+        // 3. Análisis. La extensión determina el tipo; la ruta real no se pasa al trabajador
+        const std::filesystem::path pseudoPath(std::string("archivo") + ext);
+        const openguard::ContentAnalysis analysis = openguard::analyzeContent(data, pseudoPath, &yara);
+
+        return writeAll(out, openguard::contentAnalysisToJson(analysis)) ? 0 : 3;
     } catch (const std::exception& e) {
-        analysis.ok = false;
-        analysis.error = e.what();
+        return fail(out, std::string("excepcion: ") + e.what());
+    } catch (...) {
+        return fail(out, "excepcion desconocida");
     }
-
-    return writeAll(out, openguard::contentAnalysisToJson(analysis)) ? 0 : 3;
 }

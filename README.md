@@ -44,7 +44,7 @@
 
 - **Análisis aislado** (servicio y análisis manuales de la GUI): el contenido de cada archivo se analiza en `openguard_worker.exe`, un proceso aparte que recibe el archivo como handle de solo lectura y se protege en capas:
   - token restringido sin privilegios y con el grupo Administradores deshabilitado, e integridad **baja** (se aplica desde el servicio; además el propio worker se baja a integridad baja y se quita todos los privilegios al arrancar, así que también queda protegido si el servicio no pudo crear el token);
-  - mitigaciones del proceso: sin procesos hijos, sin código dinámico (JIT/shellcode) y sin imágenes remotas;
+  - mitigación del proceso: sin creación de procesos hijos;
   - Job Object con límite de memoria (1 GB), un único proceso, sin UI y tiempo máximo por archivo;
   - **sin red**: el servicio (y el instalador) crean reglas del Firewall de Windows que bloquean todo el tráfico entrante y saliente del worker, de modo que un archivo que lograra explotarlo no puede exfiltrar datos ni descargar código. El estado se ve en Inicio > "Análisis aislado";
   - la salida del worker se valida y acota: no puede fabricar una coincidencia de firma ni provocar un aislamiento automático.

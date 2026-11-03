@@ -151,7 +151,9 @@ RunStatus runWorker(const IsolatedScanner::Options& opt, HANDLE hFile, const std
     std::wstring cmd = L"\"" + opt.workerExe.wstring() + L"\" " + std::wstring(args.begin(), args.end());
 
     std::wstring cmdFallback = cmd; // CreateProcess puede modificar el búfer: el reintento usa una copia limpia
-    const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW;
+    // DETACHED_PROCESS: sin consola. Con CREATE_NO_WINDOW Windows crea conhost.exe como proceso hijo DENTRO del
+    // Job Object, que solo admite un proceso activo, y el trabajador moriría al arrancar.
+    const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | DETACHED_PROCESS;
     PROCESS_INFORMATION pi{};
     bool started = false;
 
@@ -308,7 +310,19 @@ std::optional<ScanResult> IsolatedScanner::scan(const std::filesystem::path& fil
 
     if (!parsed) {
         // Un analizador que se cae o se cuelga con un archivo concreto es en sí un indicio sospechoso
-        if (status == RunStatus::Ok) detail = "respuesta invalida del trabajador";
+        // Diagnóstico: el trabajador responde con JSON {"ok":false,"error":...} ante un fallo controlado
+        ContentAnalysis reported;
+        if (contentAnalysisFromJson(output, reported) && !reported.error.empty()) {
+            detail += (detail.empty() ? "" : ": ") + reported.error.substr(0, 200);
+        } else if (!output.empty()) {
+            std::string snippet = output.substr(0, 120);
+            for (char& c : snippet) if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) c = '?';
+            detail += (detail.empty() ? "respuesta invalida" : "") + std::string(" | salida: ") + snippet;
+        } else if (status == RunStatus::Ok) {
+            detail = "respuesta vacia del trabajador";
+        } else if (detail.empty()) {
+            detail = "sin salida del trabajador";
+        }
         result.addThreat("Heuristic.AnalyzerFailure", "isolation", "medium", 40,
                          "El analizador aislado no pudo procesar este archivo (" + detail + ")");
         result.scanTimeMs = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();

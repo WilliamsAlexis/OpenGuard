@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -46,6 +47,14 @@ protected:
         std::ofstream o(p, std::ios::binary);
         o << s;
     }
+    /// Texto de diagnóstico con las amenazas y sus detalles (para entender fallos del proceso aislado).
+    static std::string why(const std::optional<openguard::ScanResult>& r) {
+        if (!r) return "sin resultado";
+        std::string s = "skipped=" + std::to_string(r->skipped) + " error=" + r->error + " amenazas:";
+        for (const auto& t : r->threats) s += " [" + t.name + "|" + t.method + "|" + t.details + "]";
+        return s;
+    }
+
     openguard::IsolatedScanner::Options options() const {
         openguard::IsolatedScanner::Options o;
         o.workerExe = fs::path(OPENGUARD_WORKER_PATH);
@@ -142,7 +151,7 @@ TEST_F(IsoFixture, WorkerIsAvailableAndDetectsEicarThroughHashSignature) {
     auto result = scanner.scan(file);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result->skipped);
-    EXPECT_EQ(result->sha256, "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f");
+    EXPECT_EQ(result->sha256, "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f") << why(result);
     EXPECT_TRUE(result->isThreat());
 
     bool signatureHit = false;
@@ -157,8 +166,8 @@ TEST_F(IsoFixture, WorkerReturnsCleanForHarmlessFileAndMatchesInProcessHashes) {
 
     auto result = scanner.scan(file);
     ASSERT_TRUE(result.has_value());
-    EXPECT_FALSE(result->isThreat());
-    EXPECT_EQ(result->sha256, openguard::CryptoUtils::computeSha256(file));
+    EXPECT_FALSE(result->isThreat()) << why(result);
+    EXPECT_EQ(result->sha256, openguard::CryptoUtils::computeSha256(file)) << why(result);
 }
 
 TEST_F(IsoFixture, WorkerFindsScriptHeuristicsAndDoubleExtension) {
@@ -176,7 +185,7 @@ TEST_F(IsoFixture, WorkerFindsScriptHeuristicsAndDoubleExtension) {
     ASSERT_TRUE(r2.has_value());
     bool found = false;
     for (const auto& t : r2->threats) if (t.name == "Heuristic.DoubleExtension") found = true;
-    EXPECT_TRUE(found);
+    EXPECT_TRUE(found) << why(r2);
 }
 
 TEST_F(IsoFixture, MissingOrLockedFilesAreSkippedNotCrashed) {
@@ -226,4 +235,11 @@ TEST_F(IsoFixture, FileScannerDelegatesToCustomAnalyzer) {
     auto session = scanner.scanPath(m_dir);
     EXPECT_GE(session.filesScanned, 2u);
     EXPECT_GE(session.threatsFound, 1u);
+
+    // Debe haber sido una detección real de firma, no un fallo del analizador
+    bool signatureHit = false;
+    for (const auto& r : session.results) {
+        for (const auto& t : r.threats) if (t.method == "hash_signature") signatureHit = true;
+    }
+    EXPECT_TRUE(signatureHit);
 }
