@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout del repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -64,7 +64,7 @@ jobs:
           powershell -ExecutionPolicy Bypass -File scripts/build_installer.ps1 -SkipBuild -SkipTests
 
       - name: Publicar instalador como artefacto
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OpenGuard-Installer
           path: |
