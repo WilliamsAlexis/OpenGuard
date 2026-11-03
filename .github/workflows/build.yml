@@ -17,16 +17,15 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Configurar vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '2024.01.12'
+      - name: Integrar vcpkg preinstalado
+        run: |
+          vcpkg integrate install
 
       - name: Configurar CMake y generar solucion Visual Studio
         run: |
           cmake -B build -S . `
             -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DBUILD_TESTING=ON
 
       - name: Compilar binarios (Release)
@@ -36,4 +35,3 @@ jobs:
       - name: Ejecutar pruebas unitarias automatizadas (Google Test)
         run: |
           ctest --test-dir build -C Release --output-on-failure
-
