@@ -10,6 +10,8 @@ jobs:
   build-and-test:
     name: Build & Test (MSVC 2022 / Windows 2022)
     runs-on: windows-2022
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout del repositorio
@@ -33,15 +35,19 @@ jobs:
         run: |
           cmd /c "cmake --build build --config Release > build.log 2>&1"
           $compileExit = $LASTEXITCODE
-          Get-Content build.log -Tail 150
           if ($compileExit -ne 0) { exit $compileExit }
 
-      - name: Subir log de compilacion
+      - name: Publicar log de compilacion en rama ci-logs
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
+        run: |
+          if (Test-Path build.log) {
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git checkout -B ci-logs
+            git add build.log -f
+            git commit -m "ci: build log for run ${{ github.run_id }}"
+            git push origin ci-logs -f
+          }
 
       - name: Ejecutar pruebas unitarias automatizadas (Google Test)
         run: |

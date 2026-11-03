@@ -15,5 +15,4 @@ target_link_libraries(openguard_tests PRIVATE
     GTest::gtest_main
 )
 
-include(GoogleTest)
-gtest_discover_tests(openguard_tests)
+add_test(NAME OpenGuardUnitTests COMMAND openguard_tests)
