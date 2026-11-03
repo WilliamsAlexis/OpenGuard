@@ -1805,7 +1805,7 @@ void paintHome(HDC hdc, int w, int h) {
              R(feedR.left + S(18), feedR.top + S(44), feedR.right - S(18), feedR.bottom - S(10)), g.fBody, C_MUTED);
     } else {
         int ry = feedR.top + S(40);
-        const int maxRows = std::max(1, (feedR.bottom - ry - S(8)) / S(30));
+        const int maxRows = std::max<int>(1, static_cast<int>((feedR.bottom - ry - S(8)) / S(30)));
         int shown = 0;
         for (const auto& e : g.feed) {
             if (shown++ >= maxRows) break;
