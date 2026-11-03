@@ -17,7 +17,7 @@
 #pragma comment(lib, "bcrypt.lib")
 
 #ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#define NT_SUCCESS(Status) (((LONG)(Status)) >= 0)
 #endif
 
 namespace openguard {
@@ -30,10 +30,6 @@ namespace {
  */
 class ScopedBCryptAlg {
 public:
-    /**
-     * @brief Abre un proveedor de algoritmo criptográfico de Windows.
-     * @param algId Identificador del algoritmo (ej: BCRYPT_SHA256_ALGORITHM).
-     */
     explicit ScopedBCryptAlg(LPCWSTR algId) {
         NTSTATUS status = BCryptOpenAlgorithmProvider(&m_handle, algId, nullptr, 0);
         if (!NT_SUCCESS(status)) {
@@ -41,31 +37,17 @@ public:
         }
     }
 
-    /**
-     * @brief Destructor que libera el proveedor de forma segura.
-     */
     ~ScopedBCryptAlg() {
         if (m_handle) {
             BCryptCloseAlgorithmProvider(m_handle, 0);
-            m_handle = nullptr;
         }
     }
 
-    // Deshabilitar copias no deseadas
+    [[nodiscard]] BCRYPT_ALG_HANDLE get() const noexcept { return m_handle; }
+    [[nodiscard]] bool isValid() const noexcept { return m_handle != nullptr; }
+
     ScopedBCryptAlg(const ScopedBCryptAlg&) = delete;
     ScopedBCryptAlg& operator=(const ScopedBCryptAlg&) = delete;
-
-    /**
-     * @brief Obtiene el manejador nativo del algoritmo.
-     * @return BCRYPT_ALG_HANDLE válido o nullptr.
-     */
-    [[nodiscard]] BCRYPT_ALG_HANDLE get() const noexcept { return m_handle; }
-
-    /**
-     * @brief Verifica si el proveedor se inicializó correctamente.
-     * @return true si el manejador es válido; false en caso de error.
-     */
-    [[nodiscard]] bool isValid() const noexcept { return m_handle != nullptr; }
 
 private:
     BCRYPT_ALG_HANDLE m_handle{nullptr};
@@ -73,36 +55,33 @@ private:
 
 /**
  * @class ScopedBCryptHash
- * @brief Envoltura RAII para el estado de cálculo de un hash en BCrypt.
+ * @brief Envoltura RAII para el estado dinámico de un hash criptográfico.
  */
 class ScopedBCryptHash {
 public:
-    /**
-     * @brief Inicializa el objeto hash a partir de un proveedor de algoritmos.
-     * @param algHandle Manejador del proveedor de algoritmos activo.
-     */
     explicit ScopedBCryptHash(BCRYPT_ALG_HANDLE algHandle) {
         if (!algHandle) return;
 
-        DWORD hashObjSize = 0;
-        DWORD bytesCopied = 0;
+        DWORD resultLength = 0;
+        DWORD hashObjectSize = 0;
         NTSTATUS status = BCryptGetProperty(
             algHandle,
             BCRYPT_OBJECT_LENGTH,
-            reinterpret_cast<PBYTE>(&hashObjSize),
+            reinterpret_cast<PUCHAR>(&hashObjectSize),
             sizeof(DWORD),
-            &bytesCopied,
+            &resultLength,
             0
         );
 
-        if (!NT_SUCCESS(status) || hashObjSize == 0) return;
+        if (!NT_SUCCESS(status) || hashObjectSize == 0) return;
 
-        m_hashObject.resize(hashObjSize);
+        m_hashObject.resize(hashObjectSize);
+
         status = BCryptCreateHash(
             algHandle,
             &m_hashHandle,
             m_hashObject.data(),
-            hashObjSize,
+            hashObjectSize,
             nullptr,
             0,
             0
@@ -110,91 +89,54 @@ public:
 
         if (!NT_SUCCESS(status)) {
             m_hashHandle = nullptr;
-            return;
-        }
-
-        DWORD hashLen = 0;
-        status = BCryptGetProperty(
-            algHandle,
-            BCRYPT_HASH_LENGTH,
-            reinterpret_cast<PBYTE>(&hashLen),
-            sizeof(DWORD),
-            &bytesCopied,
-            0
-        );
-
-        if (NT_SUCCESS(status) && hashLen > 0) {
-            m_hashLength = hashLen;
-            m_valid = true;
         }
     }
 
-    /**
-     * @brief Destructor que destruye el hash activo.
-     */
     ~ScopedBCryptHash() {
         if (m_hashHandle) {
             BCryptDestroyHash(m_hashHandle);
-            m_hashHandle = nullptr;
         }
     }
 
-    // Deshabilitar copias
-    ScopedBCryptHash(const ScopedBCryptHash&) = delete;
-    ScopedBCryptHash& operator=(const ScopedBCryptHash&) = delete;
-
-    /**
-     * @brief Alimenta el cálculo criptográfico con un bloque de bytes.
-     * @param data Puntero al búfer de entrada.
-     * @param size Longitud de los datos a procesar en bytes.
-     * @return true si la operación fue exitosa; false en caso contrario.
-     */
-    bool update(const void* data, size_t size) {
-        if (!m_valid || !m_hashHandle || size == 0) return m_valid;
+    bool update(const void* data, size_t length) {
+        if (!m_hashHandle || !data || length == 0) return false;
         NTSTATUS status = BCryptHashData(
             m_hashHandle,
-            reinterpret_cast<PBYTE>(const_cast<void*>(data)),
-            static_cast<ULONG>(size),
+            reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
+            static_cast<ULONG>(length),
             0
         );
         return NT_SUCCESS(status);
     }
 
-    /**
-     * @brief Finaliza el hash y devuelve el resultado en cadena hexadecimal.
-     * @return Cadena hexadecimal en minúsculas del hash calculado.
-     */
-    std::string finalize() {
-        if (!m_valid || !m_hashHandle || m_hashLength == 0) return "";
+    std::string finalize(size_t expectedHashSize) {
+        if (!m_hashHandle) return "";
 
-        std::vector<BYTE> digest(m_hashLength);
+        std::vector<UCHAR> hashBuffer(expectedHashSize);
         NTSTATUS status = BCryptFinishHash(
             m_hashHandle,
-            digest.data(),
-            m_hashLength,
+            hashBuffer.data(),
+            static_cast<ULONG>(hashBuffer.size()),
             0
         );
 
         if (!NT_SUCCESS(status)) return "";
 
         std::ostringstream oss;
-        for (BYTE b : digest) {
-            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+        for (UCHAR byte : hashBuffer) {
+            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
         }
         return oss.str();
     }
 
-    /**
-     * @brief Verifica si el objeto hash está en estado operativo.
-     * @return true si está listo; false en caso de error.
-     */
-    [[nodiscard]] bool isValid() const noexcept { return m_valid; }
+    [[nodiscard]] bool isValid() const noexcept { return m_hashHandle != nullptr; }
+
+    ScopedBCryptHash(const ScopedBCryptHash&) = delete;
+    ScopedBCryptHash& operator=(const ScopedBCryptHash&) = delete;
 
 private:
     BCRYPT_HASH_HANDLE m_hashHandle{nullptr};
-    std::vector<BYTE> m_hashObject;
-    DWORD m_hashLength{0};
-    bool m_valid{false};
+    std::vector<UCHAR> m_hashObject;
 };
 
 } // namespace anónimo
@@ -202,7 +144,11 @@ private:
 FileHashes CryptoUtils::computeFileHashes(const std::filesystem::path& filePath, size_t chunkSize) {
     FileHashes result;
 
-    // Inicializar proveedores de algoritmos para SHA-256, SHA-1 y MD5
+    std::error_code ec;
+    if (!std::filesystem::exists(filePath, ec) || std::filesystem::is_directory(filePath, ec)) {
+        return result;
+    }
+
     ScopedBCryptAlg algSha256(BCRYPT_SHA256_ALGORITHM);
     ScopedBCryptAlg algSha1(BCRYPT_SHA1_ALGORITHM);
     ScopedBCryptAlg algMd5(BCRYPT_MD5_ALGORITHM);
@@ -211,82 +157,92 @@ FileHashes CryptoUtils::computeFileHashes(const std::filesystem::path& filePath,
         return result;
     }
 
-    ScopedBCryptHash hash256(algSha256.get());
-    ScopedBCryptHash hash1(algSha1.get());
+    ScopedBCryptHash hashSha256(algSha256.get());
+    ScopedBCryptHash hashSha1(algSha1.get());
     ScopedBCryptHash hashMd5(algMd5.get());
 
-    if (!hash256.isValid() || !hash1.isValid() || !hashMd5.isValid()) {
+    if (!hashSha256.isValid() || !hashSha1.isValid() || !hashMd5.isValid()) {
         return result;
     }
 
-    // Apertura en modo binario utilizando la ruta nativa de Windows (soporta \\?\)
     std::ifstream file(filePath, std::ios::binary);
     if (!file.is_open()) {
         return result;
     }
 
-    std::vector<char> buffer(chunkSize > 0 ? chunkSize : 65536);
-    while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
-        std::streamsize bytesRead = file.gcount();
-        if (bytesRead <= 0) break;
+    std::vector<char> buffer(chunkSize);
 
-        hash256.update(buffer.data(), static_cast<size_t>(bytesRead));
-        hash1.update(buffer.data(), static_cast<size_t>(bytesRead));
-        hashMd5.update(buffer.data(), static_cast<size_t>(bytesRead));
+    while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
+        size_t bytesRead = static_cast<size_t>(file.gcount());
+        if (bytesRead == 0) break;
+
+        hashSha256.update(buffer.data(), bytesRead);
+        hashSha1.update(buffer.data(), bytesRead);
+        hashMd5.update(buffer.data(), bytesRead);
     }
 
-    result.sha256 = hash256.finalize();
-    result.sha1 = hash1.finalize();
-    result.md5 = hashMd5.finalize();
-    result.success = !result.sha256.empty() && !result.sha1.empty() && !result.md5.empty();
+    // Longitudes estándar de hash en bytes (SHA-256 = 32, SHA-1 = 20, MD5 = 16)
+    result.sha256 = hashSha256.finalize(32);
+    result.sha1   = hashSha1.finalize(20);
+    result.md5    = hashMd5.finalize(16);
 
+    result.success = (!result.sha256.empty() && !result.sha1.empty() && !result.md5.empty());
     return result;
 }
 
 std::string CryptoUtils::computeSha256(const std::filesystem::path& filePath) {
-    ScopedBCryptAlg algSha256(BCRYPT_SHA256_ALGORITHM);
-    if (!algSha256.isValid()) return "";
+    std::error_code ec;
+    if (!std::filesystem::exists(filePath, ec) || std::filesystem::is_directory(filePath, ec)) {
+        return "";
+    }
 
-    ScopedBCryptHash hash256(algSha256.get());
-    if (!hash256.isValid()) return "";
+    ScopedBCryptAlg alg(BCRYPT_SHA256_ALGORITHM);
+    if (!alg.isValid()) return "";
+
+    ScopedBCryptHash hash(alg.get());
+    if (!hash.isValid()) return "";
 
     std::ifstream file(filePath, std::ios::binary);
     if (!file.is_open()) return "";
 
     std::vector<char> buffer(65536);
     while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
-        std::streamsize bytesRead = file.gcount();
-        if (bytesRead <= 0) break;
-        hash256.update(buffer.data(), static_cast<size_t>(bytesRead));
+        size_t bytesRead = static_cast<size_t>(file.gcount());
+        if (bytesRead == 0) break;
+        hash.update(buffer.data(), bytesRead);
     }
 
-    return hash256.finalize();
+    return hash.finalize(32);
 }
 
 std::string CryptoUtils::computeSha256FromBuffer(const void* data, size_t size) {
     if (!data || size == 0) return "";
 
-    ScopedBCryptAlg algSha256(BCRYPT_SHA256_ALGORITHM);
-    if (!algSha256.isValid()) return "";
+    ScopedBCryptAlg alg(BCRYPT_SHA256_ALGORITHM);
+    if (!alg.isValid()) return "";
 
-    ScopedBCryptHash hash256(algSha256.get());
-    if (!hash256.isValid()) return "";
+    ScopedBCryptHash hash(alg.get());
+    if (!hash.isValid()) return "";
 
-    hash256.update(data, size);
-    return hash256.finalize();
+    hash.update(data, size);
+    return hash.finalize(32);
 }
 
 bool CryptoUtils::verifyIntegrity(const std::filesystem::path& filePath,
                                   const std::string& expectedSha256) {
-    std::string actual = computeSha256(filePath);
-    if (actual.empty()) return false;
+    if (expectedSha256.empty()) return false;
 
-    std::string expectedNorm = expectedSha256;
-    std::transform(expectedNorm.begin(), expectedNorm.end(), expectedNorm.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::string actualHash = computeSha256(filePath);
+    if (actualHash.empty()) return false;
 
-    return actual == expectedNorm;
+    // Comparación case-insensitive constante para evitar ataques de temporización
+    if (actualHash.length() != expectedSha256.length()) return false;
+
+    int diff = 0;
+    for (size_t i = 0; i < actualHash.length(); ++i) {
+        diff |= (std::tolower(actualHash[i]) ^ std::tolower(expectedSha256[i]));
+    }
+    return (diff == 0);
 }
 
 } // namespace openguard
-

@@ -21,7 +21,7 @@
 #pragma comment(lib, "bcrypt.lib")
 
 #ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#define NT_SUCCESS(Status) (((LONG)(Status)) >= 0)
 #endif
 
 namespace openguard {

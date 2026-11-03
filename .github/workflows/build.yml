@@ -30,8 +30,18 @@ jobs:
             -DBUILD_TESTING=ON
 
       - name: Compilar binarios (Release)
+        id: build_step
         run: |
-          cmake --build build --config Release -- /m /v:normal
+          cmake --build build --config Release -- /m /fileLogger /flp:logfile=build_output.log;verbosity=normal
+        continue-on-error: true
+
+      - name: Inspeccionar errores de compilacion
+        if: steps.build_step.outcome != 'success'
+        run: |
+          if (Test-Path build_output.log) {
+            Get-Content build_output.log | Select-String -Pattern "error C", "error LNK", "fatal error", "FAILED" -Context 2,2 | Select-Object -First 60
+          }
+          exit 1
 
       - name: Ejecutar pruebas unitarias automatizadas (Google Test)
         run: |
