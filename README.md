@@ -42,6 +42,8 @@
 
 **Limitaciones conocidas**
 
+- **Análisis aislado**: el servicio analiza el contenido de los archivos en `openguard_worker.exe`, un proceso de bajo privilegio (token restringido sin privilegios, grupo Administradores deshabilitado, integridad baja, Job Object con límite de memoria y tiempo). Si el worker falla o se cuelga con un archivo, se reporta como `Heuristic.AnalyzerFailure`. No usa AppContainer, así que no bloquea el acceso a red del worker; si el token restringido no puede aplicarse, se degrada a Job Object y se avisa en el registro.
+- La GUI aún se ejecuta como Administrador (un canal local servicio↔GUI con autorización por cliente es trabajo pendiente).
 - El motor YARA es un intérprete propio de un **subconjunto** de YARA (strings de texto/hex/regex, `N of`, `and/or/not`, `filesize`). Las reglas con módulos (`pe`, `uint16`, etc.) se descartan al cargar.
 - Opera en modo usuario (post-operación): no puede bloquear la ejecución previa como un minifilter de kernel.
 - La base de firmas incluida solo trae EICAR: use `update --online <url>` con una lista de hashes de su confianza (p. ej. un feed de abuse.ch MalwareBazaar con su `--auth-key`).

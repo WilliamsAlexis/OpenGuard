@@ -51,7 +51,11 @@ ScriptReport ScriptAnalyzer::analyze(const std::filesystem::path& filePath) {
     }
 
     std::ifstream file(filePath, std::ios::binary);
-    if (!file.is_open()) return report;
+    if (!file.is_open()) {
+        report.filePath = filePath;
+        report.scriptType = paths::extensionLower(filePath).empty() ? "Generico" : report.scriptType;
+        return report;
+    }
 
     // Lectura de hasta 512 KB para análisis estático de scripts (evita cargar archivos enormes en RAM)
     constexpr size_t kMaxScriptBytes = 512 * 1024;
@@ -60,6 +64,30 @@ ScriptReport ScriptAnalyzer::analyze(const std::filesystem::path& filePath) {
     content.resize(static_cast<size_t>(file.gcount()));
     file.close();
 
+    return analyzeContent(std::move(content), filePath);
+}
+
+ScriptReport ScriptAnalyzer::analyzeContent(std::string content, const std::filesystem::path& filePath) {
+    ScriptReport report;
+    report.filePath = filePath;
+
+    const std::string ext = paths::extensionLower(filePath);
+    if (ext == ".ps1" || ext == ".psm1" || ext == ".psd1") {
+        report.scriptType = "PowerShell";
+    } else if (ext == ".vbs" || ext == ".vbe" || ext == ".wsf") {
+        report.scriptType = "VBScript";
+    } else if (ext == ".js" || ext == ".jse") {
+        report.scriptType = "JScript";
+    } else if (ext == ".bat" || ext == ".cmd") {
+        report.scriptType = "Batch";
+    } else if (ext == ".hta") {
+        report.scriptType = "HTA";
+    } else {
+        report.scriptType = "Generico";
+    }
+
+    constexpr size_t kMaxScriptBytes = 512 * 1024;
+    if (content.size() > kMaxScriptBytes) content.resize(kMaxScriptBytes);
     if (content.empty()) return report;
 
     // Entropía de caracteres en el script
@@ -178,65 +206,64 @@ HeuristicsEngine::HeuristicsEngine()
       m_scriptAnalyzer(std::make_unique<ScriptAnalyzer>()) {
 }
 
+namespace {
+
+std::string severityFromScore(int score) {
+    if (score >= 80) return "critical";
+    if (score >= 60) return "high";
+    if (score >= 30) return "medium";
+    return "low";
+}
+
+std::string joinReasons(const std::vector<std::string>& items) {
+    std::string out;
+    for (size_t i = 0; i < items.size(); ++i) {
+        out += items[i];
+        if (i + 1 < items.size()) out += "; ";
+    }
+    return out;
+}
+
+} // namespace
+
+void HeuristicsEngine::addPEThreat(const PEReport& peRep, ScanResult& result) {
+    if (!peRep.isValidPE || peRep.heuristicScore <= 0) return;
+    result.addThreat(
+        peRep.detectedPacker.empty() ? "Heuristic.PE.Suspicious" : ("Packer." + peRep.detectedPacker),
+        "heuristic_pe",
+        severityFromScore(peRep.heuristicScore),
+        peRep.heuristicScore,
+        joinReasons(peRep.anomalyReasons)
+    );
+}
+
+void HeuristicsEngine::addScriptThreat(const ScriptReport& scRep, ScanResult& result) {
+    if (scRep.riskScore <= 0) return;
+    result.addThreat(
+        "Heuristic.Script." + scRep.scriptType,
+        "heuristic_script",
+        severityFromScore(scRep.riskScore),
+        scRep.riskScore,
+        joinReasons(scRep.findings)
+    );
+}
+
 ScanResult HeuristicsEngine::evaluate(const std::filesystem::path& filePath) {
     ScanResult result;
     result.filePath = filePath;
 
-    std::string ext = paths::extensionLower(filePath);
+    const std::string ext = paths::extensionLower(filePath);
 
     // 1. Evaluación de ejecutables y librerías PE
     if (ext == ".exe" || ext == ".dll" || ext == ".sys" || ext == ".scr" || ext == ".ocx") {
-        PEReport peRep = m_peAnalyzer->analyze(filePath);
-        if (peRep.isValidPE) {
-            if (peRep.heuristicScore > 0) {
-                std::string sev = "low";
-                if (peRep.heuristicScore >= 80) sev = "critical";
-                else if (peRep.heuristicScore >= 60) sev = "high";
-                else if (peRep.heuristicScore >= 30) sev = "medium";
-
-                std::string details;
-                for (size_t i = 0; i < peRep.anomalyReasons.size(); ++i) {
-                    details += peRep.anomalyReasons[i];
-                    if (i + 1 < peRep.anomalyReasons.size()) details += "; ";
-                }
-
-                result.addThreat(
-                    peRep.detectedPacker.empty() ? "Heuristic.PE.Suspicious" : ("Packer." + peRep.detectedPacker),
-                    "heuristic_pe",
-                    sev,
-                    peRep.heuristicScore,
-                    details
-                );
-            }
-        }
+        addPEThreat(m_peAnalyzer->analyze(filePath), result);
     }
     // 2. Evaluación de archivos de scripts
     else if (ext == ".ps1" || ext == ".vbs" || ext == ".js" || ext == ".bat" || ext == ".cmd" || ext == ".hta" || ext == ".wsf") {
-        ScriptReport scRep = m_scriptAnalyzer->analyze(filePath);
-        if (scRep.riskScore > 0) {
-            std::string sev = "low";
-            if (scRep.riskScore >= 80) sev = "critical";
-            else if (scRep.riskScore >= 60) sev = "high";
-            else if (scRep.riskScore >= 30) sev = "medium";
-
-            std::string details;
-            for (size_t i = 0; i < scRep.findings.size(); ++i) {
-                details += scRep.findings[i];
-                if (i + 1 < scRep.findings.size()) details += "; ";
-            }
-
-            result.addThreat(
-                "Heuristic.Script." + scRep.scriptType,
-                "heuristic_script",
-                sev,
-                scRep.riskScore,
-                details
-            );
-        }
+        addScriptThreat(m_scriptAnalyzer->analyze(filePath), result);
     }
 
     return result;
 }
 
 } // namespace openguard
-

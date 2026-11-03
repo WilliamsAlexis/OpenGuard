@@ -48,6 +48,12 @@ public:
     static std::string computeSha256(const std::filesystem::path& filePath);
 
     /**
+     * @brief Calcula SHA-256, SHA-1 y MD5 de un búfer en memoria (sin acceso a disco).
+     * @return FileHashes; `success` es false si no se pudo inicializar CNG.
+     */
+    static FileHashes computeBufferHashes(const void* data, size_t size);
+
+    /**
      * @brief Calcula el hash SHA-256 de un búfer de memoria existente.
      * @param data Puntero al búfer de bytes.
      * @param size Longitud del búfer en bytes.

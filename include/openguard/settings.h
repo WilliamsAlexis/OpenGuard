@@ -17,6 +17,7 @@ struct ProtectionSettings {
     bool autoQuarantine{true};     ///< Aislar automáticamente lo confirmado.
     bool decoys{true};             ///< Archivos señuelo anti-ransomware.
     bool scanUsb{true};            ///< Analizar unidades USB al conectarlas.
+    bool isolatedScan{true};       ///< Analizar el contenido en un proceso aislado de bajo privilegio.
     int cpuPercent{50};            ///< Límite de CPU para análisis (10-100): fracción de núcleos usada.
     std::vector<std::filesystem::path> exclusions; ///< Carpetas o archivos que no se analizan.
 

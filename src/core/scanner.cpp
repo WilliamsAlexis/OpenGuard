@@ -47,6 +47,8 @@ FileScanner::FileScanner(std::shared_ptr<SignatureDB> sigDb, ScannerConfig confi
 }
 
 ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
+    if (m_config.customAnalyzer) return m_config.customAnalyzer(filePath);
+
     ScanResult result;
     result.filePath = filePath;
 
@@ -95,25 +97,7 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
     // 3. Cotejo contra la base de datos de firmas (SQLite)
     if (m_sigDb && m_sigDb->isOpen()) {
         auto match = m_sigDb->lookup(result.sha256, result.sha1, result.md5);
-        if (match.has_value()) {
-            int score = 75; // Puntuación predeterminada alta
-            if (match->severity == "critical") score = 100;
-            else if (match->severity == "high") score = 80;
-            else if (match->severity == "medium") score = 50;
-            else if (match->severity == "low") score = 25;
-
-            // Una coincidencia exacta de hash es siempre una detección confirmada: nunca debe
-            // quedar por debajo del umbral de amenaza aunque la severidad registrada sea baja.
-            score = std::max(score, 61);
-
-            result.addThreat(
-                match->malwareName,
-                "hash_signature",
-                match->severity,
-                score,
-                "Coincidencia exacta de hash en la base de datos"
-            );
-        }
+        if (match.has_value()) addSignatureMatch(result, *match);
     }
 
     // 4. Heurística de doble extensión sospechosa (ej: "documento.pdf.exe")
@@ -156,6 +140,21 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
     result.scanTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
 
     return result;
+}
+
+void FileScanner::addSignatureMatch(ScanResult& result, const SignatureRecord& match) {
+    int score = 75; // Puntuación predeterminada alta
+    if (match.severity == "critical") score = 100;
+    else if (match.severity == "high") score = 80;
+    else if (match.severity == "medium") score = 50;
+    else if (match.severity == "low") score = 25;
+
+    // Una coincidencia exacta de hash es siempre una detección confirmada: nunca debe
+    // quedar por debajo del umbral de amenaza aunque la severidad registrada sea baja.
+    score = std::max(score, 61);
+
+    result.addThreat(match.malwareName, "hash_signature", match.severity, score,
+                     "Coincidencia exacta de hash en la base de datos");
 }
 
 bool FileScanner::hasDoubleExtension(const std::filesystem::path& path) {

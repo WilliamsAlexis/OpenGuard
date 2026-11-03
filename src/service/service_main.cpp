@@ -13,6 +13,7 @@
 
 #include "openguard/crypto_utils.h"
 #include "openguard/history.h"
+#include "openguard/isolated_scan.h"
 #include "openguard/settings.h"
 #include "openguard/paths.h"
 #include "openguard/quarantine.h"
@@ -131,6 +132,27 @@ public:
         cfg.excludedPaths.push_back(openguard::paths::executableDir());
         cfg.excludedPaths.push_back(openguard::paths::signaturesDir());
         cfg.yaraRulesDir = openguard::paths::signaturesDir() / "yara_rules";
+
+        // Análisis de contenido en un proceso aislado (token restringido, integridad baja, Job Object).
+        // Si el trabajador no está disponible o no puede iniciarse, se usa el análisis en proceso como respaldo.
+        if (m_set.isolatedScan) {
+            openguard::IsolatedScanner::Options opts;
+            opts.workerExe = openguard::paths::executableDir() / "openguard_worker.exe";
+            auto isolated = std::make_shared<openguard::IsolatedScanner>(m_db, opts);
+            if (isolated->available()) {
+                openguard::ScannerConfig fbCfg = cfg;
+                fbCfg.threadCount = 1;
+                auto fallback = std::make_shared<openguard::FileScanner>(m_db, fbCfg);
+                cfg.customAnalyzer = [isolated, fallback](const fs::path& p) -> openguard::ScanResult {
+                    if (auto r = isolated->scan(p)) return *r;
+                    return fallback->scanFile(p);
+                };
+                m_isolated = isolated;
+                g_log.write("INFO", "Analisis aislado activo (proceso trabajador de bajo privilegio)");
+            } else {
+                g_log.write("WARN", "openguard_worker.exe no encontrado: el analisis se hace dentro del servicio");
+            }
+        }
         m_config = cfg;
         m_scanner = std::make_unique<openguard::FileScanner>(m_db, cfg);
         m_vault = std::make_unique<openguard::QuarantineVault>(openguard::paths::quarantineDir());
@@ -163,6 +185,11 @@ public:
     /// Llamada periódica: detecta unidades extraíbles recién conectadas.
     void poll() {
         checkDecoys();
+        if (m_isolated && m_isolated->degraded() && !m_degradedLogged) {
+            m_degradedLogged = true;
+            g_log.write("WARN", "Analisis aislado en modo degradado: no se pudo aplicar el token restringido (solo Job Object)");
+            hist("system", "WARN", {}, "Analisis aislado degradado", "sin token restringido");
+        }
         const std::set<wchar_t> current = currentRemovableDrives();
         for (wchar_t letter : current) {
             if (m_knownRemovable.insert(letter).second && m_scanUsb) {
@@ -259,6 +286,8 @@ private:
     }
 
     openguard::ProtectionSettings m_set;
+    std::shared_ptr<openguard::IsolatedScanner> m_isolated;
+    bool m_degradedLogged{false};
     std::unique_ptr<openguard::ThreatHistory> m_history;
     bool m_autoQuarantine{true};
     bool m_enableDecoys{true};

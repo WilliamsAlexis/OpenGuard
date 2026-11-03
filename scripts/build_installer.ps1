@@ -79,11 +79,12 @@ Step 'Preparando binarios en dist\stage'
 $cli = Join-Path $buildDir "src\cli\$Config\openguard_cli.exe"
 $svc = Join-Path $buildDir "src\service\$Config\openguard_service.exe"
 $gui = Join-Path $buildDir "src\gui\$Config\openguard_gui.exe"
-foreach ($f in @($cli, $svc, $gui)) { if (-not (Test-Path $f)) { Fail "No se encontro $f (compile primero)." } }
+$worker = Join-Path $buildDir "src\worker\$Config\openguard_worker.exe"
+foreach ($f in @($cli, $svc, $gui, $worker)) { if (-not (Test-Path $f)) { Fail "No se encontro $f (compile primero)." } }
 
 if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
 New-Item -ItemType Directory -Path $stageDir | Out-Null
-Copy-Item $cli, $svc, $gui -Destination $stageDir
+Copy-Item $cli, $svc, $gui, $worker -Destination $stageDir
 
 # El runtime es estatico: no deben existir dependencias de DLL que no sean del sistema
 Step 'Verificando que los binarios no dependan de DLLs externas'

@@ -35,6 +35,8 @@ struct ScannerConfig {
     bool keepCleanResults{false};               ///< Conservar en la sesión también los archivos limpios (consume memoria en escaneos grandes).
     std::vector<std::filesystem::path> excludedPaths; ///< Directorios que se omiten en escaneos recursivos (ej: la cuarentena).
     std::filesystem::path yaraRulesDir;         ///< Carpeta con reglas *.yar (vacía = motor YARA desactivado).
+    /// Si se define, scanFile() delega en este analizador (p. ej. el proceso aislado del servicio).
+    std::function<ScanResult(const std::filesystem::path&)> customAnalyzer;
 };
 
 /**
@@ -95,6 +97,12 @@ public:
      */
     [[nodiscard]] static std::vector<std::filesystem::path> getFixedDrives();
 
+    /// Convierte una coincidencia de la base de firmas en una amenaza confirmada (puntuación mínima 61).
+    static void addSignatureMatch(ScanResult& result, const SignatureRecord& match);
+
+    /// Detecta extensiones dobles engañosas (ej: "factura.pdf.exe").
+    [[nodiscard]] static bool hasDoubleExtension(const std::filesystem::path& path);
+
     /**
      * @brief Detiene anticipadamente un escaneo en curso de forma segura.
      */
@@ -115,8 +123,6 @@ private:
      * @param path Ruta del archivo a examinar.
      * @return true si presenta patrón de doble extensión maliciosa; false en caso contrario.
      */
-    [[nodiscard]] static bool hasDoubleExtension(const std::filesystem::path& path);
-
     std::shared_ptr<SignatureDB> m_sigDb;
     ScannerConfig m_config;
     std::unique_ptr<ThreadPool> m_threadPool;

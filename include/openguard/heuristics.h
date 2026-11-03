@@ -57,6 +57,9 @@ public:
      */
     [[nodiscard]] ScriptReport analyze(const std::filesystem::path& filePath);
 
+    /// Analiza el contenido de un script ya cargado en memoria (extension tomada de filePath).
+    [[nodiscard]] ScriptReport analyzeContent(std::string content, const std::filesystem::path& filePath);
+
 private:
     void analyzePowerShell(const std::string& content, ScriptReport& report);
     void analyzeVbsJs(const std::string& content, ScriptReport& report);
@@ -78,6 +81,12 @@ public:
      * @return ScanResult con las amenazas heurísticas detectadas.
      */
     [[nodiscard]] ScanResult evaluate(const std::filesystem::path& filePath);
+
+    /// Convierte un informe PE en una amenaza heurística (si su puntuación es > 0).
+    static void addPEThreat(const PEReport& report, ScanResult& result);
+
+    /// Convierte un informe de script en una amenaza heurística (si su puntuación es > 0).
+    static void addScriptThreat(const ScriptReport& report, ScanResult& result);
 
 private:
     std::unique_ptr<PEAnalyzer> m_peAnalyzer;

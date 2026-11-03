@@ -18,6 +18,8 @@ add_library(openguard_core STATIC
     net_update.cpp
     updater.cpp
     app_update.cpp
+    content_analysis.cpp
+    isolated_scan.cpp
     settings.cpp
     history.cpp
 )

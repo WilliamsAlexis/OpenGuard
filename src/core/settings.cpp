@@ -36,6 +36,7 @@ ProtectionSettings ProtectionSettings::load(const std::filesystem::path& iniPath
     s.autoQuarantine = GetPrivateProfileIntW(L"service", L"auto_quarantine", 1, f.c_str()) != 0;
     s.decoys = GetPrivateProfileIntW(L"service", L"decoys", 1, f.c_str()) != 0;
     s.scanUsb = GetPrivateProfileIntW(L"service", L"scan_usb", 1, f.c_str()) != 0;
+    s.isolatedScan = GetPrivateProfileIntW(L"service", L"isolated_scan", 1, f.c_str()) != 0;
     s.cpuPercent = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"service", L"cpu_percent", 50, f.c_str())), 10, 100);
 
     const UINT count = std::min<UINT>(GetPrivateProfileIntW(L"exclusions", L"count", 0, f.c_str()), 500);
@@ -72,6 +73,7 @@ bool ProtectionSettings::save(const std::filesystem::path& iniPath) const {
     put(L"service", L"auto_quarantine", autoQuarantine ? L"1" : L"0");
     put(L"service", L"decoys", decoys ? L"1" : L"0");
     put(L"service", L"scan_usb", scanUsb ? L"1" : L"0");
+    put(L"service", L"isolated_scan", isolatedScan ? L"1" : L"0");
     put(L"service", L"cpu_percent", std::to_wstring(std::clamp(cpuPercent, 10, 100)));
 
     WritePrivateProfileStringW(L"exclusions", nullptr, nullptr, f.c_str()); // borra la sección anterior

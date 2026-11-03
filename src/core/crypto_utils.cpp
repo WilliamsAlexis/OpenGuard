@@ -190,6 +190,38 @@ FileHashes CryptoUtils::computeFileHashes(const std::filesystem::path& filePath,
     return result;
 }
 
+
+FileHashes CryptoUtils::computeBufferHashes(const void* data, size_t size) {
+    FileHashes result;
+
+    ScopedBCryptAlg algSha256(BCRYPT_SHA256_ALGORITHM);
+    ScopedBCryptAlg algSha1(BCRYPT_SHA1_ALGORITHM);
+    ScopedBCryptAlg algMd5(BCRYPT_MD5_ALGORITHM);
+    if (!algSha256.isValid() || !algSha1.isValid() || !algMd5.isValid()) return result;
+
+    ScopedBCryptHash hashSha256(algSha256.get());
+    ScopedBCryptHash hashSha1(algSha1.get());
+    ScopedBCryptHash hashMd5(algMd5.get());
+    if (!hashSha256.isValid() || !hashSha1.isValid() || !hashMd5.isValid()) return result;
+
+    // BCryptHashData acepta bloques de hasta 4 GB; se alimenta en trozos de 16 MB por prudencia
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t offset = 0;
+    while (offset < size) {
+        const size_t chunk = std::min<size_t>(size - offset, 16u * 1024u * 1024u);
+        hashSha256.update(bytes + offset, chunk);
+        hashSha1.update(bytes + offset, chunk);
+        hashMd5.update(bytes + offset, chunk);
+        offset += chunk;
+    }
+
+    result.sha256 = hashSha256.finalize(32);
+    result.sha1 = hashSha1.finalize(20);
+    result.md5 = hashMd5.finalize(16);
+    result.success = (!result.sha256.empty() && !result.sha1.empty() && !result.md5.empty());
+    return result;
+}
+
 std::string CryptoUtils::computeSha256(const std::filesystem::path& filePath) {
     std::error_code ec;
     if (!std::filesystem::exists(filePath, ec) || std::filesystem::is_directory(filePath, ec)) {

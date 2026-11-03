@@ -83,6 +83,8 @@ Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:Add
 Source: "{#StageDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\{#MyServiceExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\{#MyGuiExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Proceso aislado de analisis (el servicio lo lanza con token restringido e integridad baja)
+Source: "{#StageDir}\openguard_worker.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Base de firmas y reglas
 Source: "signatures\hashes_index.json"; DestDir: "{app}\signatures"; Flags: ignoreversion

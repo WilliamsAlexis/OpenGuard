@@ -334,6 +334,16 @@ PEReport PEAnalyzer::analyze(const std::filesystem::path& filePath) {
     }
     file.close();
 
+    return analyzeBuffer(buffer, &filePath);
+}
+
+PEReport PEAnalyzer::analyzeBuffer(const std::vector<uint8_t>& buffer, const std::filesystem::path* signaturePath) {
+    PEReport report;
+    const size_t fileSize = buffer.size();
+    if (fileSize < sizeof(IMAGE_DOS_HEADER)) {
+        return report; // Demasiado pequeño para ser un PE
+    }
+
     // 2. Parseo del encabezado DOS
     IMAGE_DOS_HEADER dosHeader{};
     std::memcpy(&dosHeader, buffer.data(), sizeof(dosHeader));
@@ -476,8 +486,22 @@ PEReport PEAnalyzer::analyze(const std::filesystem::path& filePath) {
     // 8. Inspección de la tabla de importaciones (IAT)
     analyzeImports(buffer, report);
 
-    // 9. Verificación de firma digital Authenticode
-    report.isSigned = verifyAuthenticodeSignature(filePath, report.isSignatureValid, report.signerSubject);
+    // 9. Verificación de firma digital Authenticode (necesita acceso al archivo y a servicios del
+    //    sistema: se omite cuando el análisis se hace sobre memoria, p. ej. en el proceso aislado)
+    if (signaturePath) {
+        bool valid = false;
+        std::wstring signer;
+        const bool hasSignature = verifyAuthenticodeSignature(*signaturePath, valid, signer);
+        applySignatureResult(report, hasSignature, valid, signer);
+    }
+
+    return report;
+}
+
+void PEAnalyzer::applySignatureResult(PEReport& report, bool isSigned, bool isValid, const std::wstring& signer) {
+    report.isSigned = isSigned;
+    report.isSignatureValid = isValid;
+    report.signerSubject = signer;
     if (!report.isSigned) {
         report.addAnomaly("Ejecutable no cuenta con firma digital Authenticode", 10);
     } else if (!report.isSignatureValid) {
@@ -486,8 +510,6 @@ PEReport PEAnalyzer::analyze(const std::filesystem::path& filePath) {
         // Una firma válida y confiable reduce sustancialmente la sospecha de las anomalías estructurales
         report.heuristicScore = report.heuristicScore / 2;
     }
-
-    return report;
 }
 
 void PEAnalyzer::checkPackerSignatures(const std::vector<uint8_t>& fileBuffer, PEReport& report) {

@@ -13,6 +13,7 @@ add_executable(openguard_tests
     test_update.cpp
     test_app_update.cpp
     test_hardening.cpp
+    test_isolation.cpp
 )
 
 target_compile_definitions(openguard_tests PRIVATE
@@ -26,3 +27,9 @@ target_link_libraries(openguard_tests PRIVATE
 )
 
 add_test(NAME OpenGuardUnitTests COMMAND openguard_tests)
+
+# Las pruebas de aislamiento ejecutan el trabajador real: debe compilarse antes y conocerse su ruta
+add_dependencies(openguard_tests openguard_worker)
+target_compile_definitions(openguard_tests PRIVATE
+    OPENGUARD_WORKER_PATH="$<TARGET_FILE:openguard_worker>"
+)

@@ -105,6 +105,18 @@ public:
     [[nodiscard]] PEReport analyze(const std::filesystem::path& filePath);
 
     /**
+     * @brief Analiza un PE ya cargado en memoria (sin acceso a disco).
+     * @param buffer Contenido completo del archivo.
+     * @param signaturePath Si no es nulo, se verifica la firma Authenticode de esa ruta; si es nulo se omite
+     *        (el llamador puede completarla con applySignatureResult).
+     */
+    [[nodiscard]] PEReport analyzeBuffer(const std::vector<uint8_t>& buffer,
+                                         const std::filesystem::path* signaturePath = nullptr);
+
+    /// Incorpora al informe el resultado de la verificación de firma (suma/resta puntos de riesgo).
+    static void applySignatureResult(PEReport& report, bool isSigned, bool isValid, const std::wstring& signer);
+
+    /**
      * @brief Calcula la entropía de Shannon matemática de un búfer de bytes.
      * @details Mide la aleatoriedad de los datos entre 0.0 (constante) y 8.0 (cifrado/empaquetado).
      * @param data Puntero al búfer de bytes.

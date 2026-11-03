@@ -90,6 +90,9 @@ if(BUILD_SERVICE)
     add_subdirectory(src/service)
 endif()
 
+# Proceso trabajador aislado (lo usa el servicio para analizar contenido no confiable)
+add_subdirectory(src/worker)
+
 # Interfaz grafica: openguard_gui
 if(BUILD_GUI)
     add_subdirectory(src/gui)
