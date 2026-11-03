@@ -53,7 +53,10 @@ endif()
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Búsqueda de dependencias mediante CMake / vcpkg
-find_package(sqlite3 CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG QUIET)
+if(NOT TARGET unofficial::sqlite3::sqlite3)
+    find_package(SQLite3 REQUIRED)
+endif()
 find_package(nlohmann_json CONFIG QUIET)
 
 # Biblioteca central: openguard_core
@@ -73,10 +76,12 @@ endif()
 if(BUILD_TESTING)
     enable_testing()
     find_package(GTest CONFIG QUIET)
-    if(GTest_FOUND)
+    if(NOT TARGET GTest::gtest)
+        find_package(GTest QUIET)
+    endif()
+    if(TARGET GTest::gtest)
         add_subdirectory(tests)
     else()
-        message(STATUS "Google Test no encontrado en vcpkg. Pruebas deshabilitadas temporalmente.")
+        message(STATUS "Google Test no encontrado. Pruebas unitarias omitidas en esta fase.")
     endif()
 endif()
-

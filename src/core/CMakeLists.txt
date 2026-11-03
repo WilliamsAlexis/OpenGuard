@@ -26,8 +26,16 @@ target_link_libraries(openguard_core PUBLIC
     iphlpapi        # IP Helper API para conexiones TCP/UDP y adaptadores
     ws2_32          # Windows Sockets (Winsock)
     netapi32        # Gestión de usuarios y cuentas de red
-    sqlite3         # Base de datos SQLite3
 )
+
+# Enlace flexible de SQLite3 según proveedor (vcpkg config o FindSQLite3)
+if(TARGET unofficial::sqlite3::sqlite3)
+    target_link_libraries(openguard_core PUBLIC unofficial::sqlite3::sqlite3)
+elseif(TARGET SQLite::SQLite3)
+    target_link_libraries(openguard_core PUBLIC SQLite::SQLite3)
+else()
+    target_link_libraries(openguard_core PUBLIC sqlite3)
+endif()
 
 if(TARGET nlohmann_json::nlohmann_json)
     target_link_libraries(openguard_core PUBLIC nlohmann_json::nlohmann_json)
