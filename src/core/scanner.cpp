@@ -299,7 +299,7 @@ std::vector<std::filesystem::path> FileScanner::getFixedDrives() {
     const DWORD mask = GetLogicalDrives();
     for (int i = 0; i < 26; ++i) {
         if ((mask & (1u << i)) == 0) continue;
-        const wchar_t root[] = { static_cast<wchar_t>(L'A' + i), L':', L'\', L'\0' };
+        const wchar_t root[] = { static_cast<wchar_t>(L'A' + i), L':', L'\\', L'\0' };
         if (GetDriveTypeW(root) == DRIVE_FIXED) {
             drives.emplace_back(root);
         }
