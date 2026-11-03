@@ -1,0 +1,39 @@
+name: OpenGuard Windows C++20 CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (MSVC 2022 / Windows 2022)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configurar vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '2024.01.12'
+
+      - name: Configurar CMake y generar solucion Visual Studio
+        run: |
+          cmake -B build -S . `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DBUILD_TESTING=ON
+
+      - name: Compilar binarios (Release)
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Ejecutar pruebas unitarias automatizadas (Google Test)
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+

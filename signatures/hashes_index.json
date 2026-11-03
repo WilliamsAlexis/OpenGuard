@@ -1,0 +1,30 @@
+{
+  "version": "0.1.0",
+  "last_updated": "2026-11-02T22:00:00Z",
+  "total_signatures": 2,
+  "sources": [
+    "openguard-builtin",
+    "eicar"
+  ],
+  "signatures": [
+    {
+      "sha256": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+      "sha1": "3395856ce81f2b7382dee72602f798b642f14d8",
+      "md5": "44d88612fea8a8f36de82e1278abb02f",
+      "malware_name": "EICAR-Standard-AV-Test-File",
+      "threat_type": "test_file",
+      "severity": "low",
+      "source": "eicar"
+    },
+    {
+      "sha256": "13db60afb914a2ee9b3649d1947d58046d1a9e9b8e4114d80b1d5c142b4ed7fa",
+      "sha1": "02dc45ac70bbaec8a8cfff5b119fa52ca6e991f4",
+      "md5": "c637d527c86186464879dc45e7816c53",
+      "malware_name": "EICAR-Standard-AV-Test-File-Raw",
+      "threat_type": "test_file",
+      "severity": "low",
+      "source": "eicar"
+    }
+  ]
+}
+
