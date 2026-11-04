@@ -144,6 +144,83 @@ jobs:
           "$hash  OpenGuard_Instalador.zip" | Set-Content -Encoding ascii "$zip.sha256"
           Write-Host "Instalador en zip: $zip SHA-256 $hash"
 
+      - name: Crear paquete MSIX (experimental, sin firmar)
+        continue-on-error: true   # experimental: si falla no debe impedir publicar el instalador
+        run: |
+          $cmake = Get-Content CMakeLists.txt -Raw
+          if ($cmake -notmatch '(?s)project\(\s*OpenGuard\s+VERSION\s+(\d+\.\d+\.\d+)') { throw "No se pudo leer la version" }
+          $ver = $Matches[1]
+          $layout = "dist\msix_layout"
+          Remove-Item $layout -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "$layout\Assets" | Out-Null
+          Copy-Item "dist\stage\*.exe" $layout
+          Copy-Item "signatures" "$layout\signatures" -Recurse
+          Copy-Item LICENSE, PRIVACY.md, README.md $layout
+
+          # Iconos del paquete a partir de assets\logo.png (cuadrado, fondo transparente)
+          Add-Type -AssemblyName System.Drawing
+          $src = [System.Drawing.Image]::FromFile((Resolve-Path "assets\logo.png"))
+          foreach ($t in @(@{n='Square44x44Logo';w=44;h=44}, @{n='Square150x150Logo';w=150;h=150}, @{n='StoreLogo';w=50;h=50})) {
+            $bmp = New-Object System.Drawing.Bitmap $t.w, $t.h
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $g.Clear([System.Drawing.Color]::Transparent)
+            $scale = [Math]::Min($t.w / $src.Width, $t.h / $src.Height)
+            $dw = [int]($src.Width * $scale); $dh = [int]($src.Height * $scale)
+            $g.DrawImage($src, [int](($t.w - $dw) / 2), [int](($t.h - $dh) / 2), $dw, $dh)
+            $bmp.Save((Join-Path (Resolve-Path "$layout\Assets") "$($t.n).png"), [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+          }
+          $src.Dispose()
+
+          $manifest = @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+                   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+                   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+                   IgnorableNamespaces="uap rescap">
+            <Identity Name="WilliamsAlexis.OpenGuard" Publisher="CN=WilliamsAlexis" Version="$ver.0" ProcessorArchitecture="x64" />
+            <Properties>
+              <DisplayName>OpenGuard Antivirus</DisplayName>
+              <PublisherDisplayName>Alexis Williams</PublisherDisplayName>
+              <Logo>Assets\StoreLogo.png</Logo>
+            </Properties>
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+            </Dependencies>
+            <Resources>
+              <Resource Language="es-mx" />
+              <Resource Language="en-us" />
+            </Resources>
+            <Applications>
+              <Application Id="OpenGuard" Executable="openguard_gui.exe" EntryPoint="Windows.FullTrustApplication">
+                <uap:VisualElements DisplayName="OpenGuard Antivirus" Description="Antivirus gratuito y de codigo abierto para Windows"
+                                    BackgroundColor="#0B1220" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+              </Application>
+            </Applications>
+            <Capabilities>
+              <rescap:Capability Name="runFullTrust" />
+              <rescap:Capability Name="allowElevation" />
+            </Capabilities>
+          </Package>
+          "@
+          Set-Content -Path "$layout\AppxManifest.xml" -Value $manifest -Encoding utf8
+
+          $makeappx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $makeappx) { throw "No se encontro makeappx.exe" }
+          $out = "dist\OpenGuard_v$ver.msix"
+          & $makeappx.FullName pack /d $layout /p $out /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx fallo" }
+          Write-Host "MSIX: $out ($([math]::Round((Get-Item $out).Length / 1MB, 2)) MB)"
+
+      - name: Publicar paquete MSIX como artefacto (experimental)
+        uses: actions/upload-artifact@v5
+        with:
+          name: OpenGuard-MSIX-experimental
+          path: dist/OpenGuard_v*.msix
+          if-no-files-found: warn
+
       - name: Publicar instalador como artefacto
         uses: actions/upload-artifact@v5
         with:
