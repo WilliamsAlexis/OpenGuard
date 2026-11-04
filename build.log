@@ -1,0 +1,130 @@
+MSBuild version 17.14.60+43b635718 for .NET Framework
+
+  1>Checking Build System
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/src/core/CMakeLists.txt
+  crypto_utils.cpp
+  paths.cpp
+  signatures.cpp
+  thread_pool.cpp
+  scanner.cpp
+  pe_analyzer.cpp
+  quarantine.cpp
+  heuristics.cpp
+  vuln_scan.cpp
+  network_scan.cpp
+  realtime_monitor.cpp
+  yara_lite.cpp
+  net_update.cpp
+  updater.cpp
+  app_update.cpp
+  content_analysis.cpp
+  isolated_scan.cpp
+  settings.cpp
+  history.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xutility(4813,18): warning C4244: '=': conversion from 'const wchar_t' to 'char', possible loss of data [D:\a\OpenGuard\OpenGuard\build\src\core\openguard_core.vcxproj]
+  (compiling source file '../../../src/core/settings.cpp')
+      C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xutility(4813,18):
+      the template instantiation context (the oldest one first) is
+          D:\a\OpenGuard\OpenGuard\src\core\settings.cpp(44,41):
+          see reference to function template instantiation 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_const_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' being compiled
+          with
+          [
+              _Elem=wchar_t,
+              _Iter=std::_String_const_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+              _Alloc=std::allocator<char>
+          ]
+              D:\a\OpenGuard\OpenGuard\src\core\settings.cpp(44,28):
+              see the first reference to 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' in 'openguard::ProtectionSettings::load'
+          C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xstring(812,17):
+          see reference to function template instantiation 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<const wchar_t*,const wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' being compiled
+          with
+          [
+              _Size_type=unsigned __int64,
+              _Iter=const wchar_t *,
+              _Sent=const wchar_t *,
+              _Size=unsigned __int64
+          ]
+          C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xstring(968,18):
+          see reference to function template instantiation '_OutIt *std::_Copy_n_unchecked4<const wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' being compiled
+          with
+          [
+              _OutIt=char *,
+              _Size=unsigned __int64,
+              _InIt=const wchar_t *,
+              _SizeTy=unsigned __int64
+          ]
+  
+  office_macros.cpp
+  Generating Code...
+  Compiling...
+  drive_tools.cpp
+  update_verify.cpp
+  secrets.cpp
+  feeds.cpp
+  cleaner.cpp
+  Generating Code...
+  openguard_core.vcxproj -> D:\a\OpenGuard\OpenGuard\build\src\core\Release\openguard_core.lib
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/src/worker/CMakeLists.txt
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/src/service/CMakeLists.txt
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/src/cli/CMakeLists.txt
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/src/gui/CMakeLists.txt
+  main_cli.cpp
+  service_main.cpp
+  main_worker.cpp
+  main_gui.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xutility(4813,18): warning C4244: '=': conversion from 'const wchar_t' to 'char', possible loss of data [D:\a\OpenGuard\OpenGuard\build\src\service\openguard_service.vcxproj]
+  (compiling source file '../../../src/service/service_main.cpp')
+      C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xutility(4813,18):
+      the template instantiation context (the oldest one first) is
+          D:\a\OpenGuard\OpenGuard\src\service\service_main.cpp(343,54):
+          see reference to function template instantiation 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_const_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' being compiled
+          with
+          [
+              _Elem=wchar_t,
+              _Iter=std::_String_const_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+              _Alloc=std::allocator<char>
+          ]
+              D:\a\OpenGuard\OpenGuard\src\service\service_main.cpp(343,9):
+              see the first reference to 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' in '`anonymous-namespace'::ProtectionEngine::readLastScheduledRun'
+          C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xstring(812,17):
+          see reference to function template instantiation 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<const wchar_t*,const wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' being compiled
+          with
+          [
+              _Size_type=unsigned __int64,
+              _Iter=const wchar_t *,
+              _Sent=const wchar_t *,
+              _Size=unsigned __int64
+          ]
+          C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\xstring(968,18):
+          see reference to function template instantiation '_OutIt *std::_Copy_n_unchecked4<const wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' being compiled
+          with
+          [
+              _OutIt=char *,
+              _Size=unsigned __int64,
+              _InIt=const wchar_t *,
+              _SizeTy=unsigned __int64
+          ]
+  
+  openguard_worker.vcxproj -> D:\a\OpenGuard\OpenGuard\build\src\worker\Release\openguard_worker.exe
+  openguard_service.vcxproj -> D:\a\OpenGuard\OpenGuard\build\src\service\Release\openguard_service.exe
+  openguard_cli.vcxproj -> D:\a\OpenGuard\OpenGuard\build\src\cli\Release\openguard_cli.exe
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/tests/CMakeLists.txt
+  test_signatures.cpp
+  openguard_gui.vcxproj -> D:\a\OpenGuard\OpenGuard\build\src\gui\Release\openguard_gui.exe
+  test_scanner.cpp
+  test_quarantine.cpp
+  test_heuristics.cpp
+  test_extra_core.cpp
+  test_realtime_pe.cpp
+  test_yara.cpp
+  test_update.cpp
+  test_app_update.cpp
+  test_hardening.cpp
+  test_isolation.cpp
+  test_phase1.cpp
+  test_drive.cpp
+  test_feeds.cpp
+  test_cleaner.cpp
+  Generating Code...
+  openguard_tests.vcxproj -> D:\a\OpenGuard\OpenGuard\build\tests\Release\openguard_tests.exe
+  Building Custom Rule D:/a/OpenGuard/OpenGuard/CMakeLists.txt
