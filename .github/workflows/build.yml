@@ -108,6 +108,17 @@ jobs:
             Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Crear version portatil (.zip)
+        run: |
+          # Mismo contenido que el instalador pero sin instalar nada: se descomprime y se ejecuta openguard_gui.exe.
+          $zip = "dist\OpenGuard_Portable.zip"
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Copy-Item "installer\LEEME_PORTATIL.txt" "dist\stage\LEEME.txt" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist\stage\*" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  OpenGuard_Portable.zip" | Set-Content -Encoding ascii "$zip.sha256"
+          Write-Host "Portatil: $zip SHA-256 $hash"
+
       - name: Publicar instalador como artefacto
         uses: actions/upload-artifact@v5
         with:
@@ -115,6 +126,8 @@ jobs:
           path: |
             dist/OpenGuard_Setup_v*.exe
             dist/OpenGuard_Setup_v*.exe.sha256
+            dist/OpenGuard_Portable.zip
+            dist/OpenGuard_Portable.zip.sha256
           if-no-files-found: error
 
       - name: Adjuntar instalador a la release (tags v*)
@@ -124,3 +137,5 @@ jobs:
           files: |
             dist/OpenGuard_Setup_v*.exe
             dist/OpenGuard_Setup_v*.exe.sha256
+            dist/OpenGuard_Portable.zip
+            dist/OpenGuard_Portable.zip.sha256

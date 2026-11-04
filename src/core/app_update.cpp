@@ -79,7 +79,8 @@ AppUpdateInfo parseLatestRelease(const std::string& json, const std::string& cur
             if (ln.size() > 4 && ln.compare(ln.size() - 4, 4, ".exe") == 0 && ln.find("setup") != std::string::npos) {
                 info.installerUrl = url;
                 info.installerName = name;
-            } else if (ln.size() > 7 && ln.compare(ln.size() - 7, 7, ".sha256") == 0) {
+            } else if (ln.size() > 7 && ln.compare(ln.size() - 7, 7, ".sha256") == 0 && ln.find("setup") != std::string::npos) {
+                // solo el hash del instalador: la Release puede incluir tambien el .zip portatil con su propio .sha256
                 info.sha256Url = url;
             }
         }
