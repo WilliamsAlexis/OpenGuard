@@ -112,9 +112,23 @@ jobs:
         run: |
           # Mismo contenido que el instalador pero sin instalar nada: se descomprime y se ejecuta openguard_gui.exe.
           $zip = "dist\OpenGuard_Portable.zip"
-          Remove-Item $zip -Force -ErrorAction SilentlyContinue
-          Copy-Item "installer\LEEME_PORTATIL.txt" "dist\stage\LEEME.txt" -ErrorAction SilentlyContinue
-          Compress-Archive -Path "dist\stage\*" -DestinationPath $zip -CompressionLevel Optimal
+          $pack = "dist\portable\OpenGuard"
+          Remove-Item $zip, "dist\portable" -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $pack | Out-Null
+          Copy-Item "dist\stage\*.exe" $pack
+          Copy-Item "signatures" "$pack\signatures" -Recurse
+          Copy-Item README.md, LICENSE, PRIVACY.md $pack
+          Set-Content -Encoding utf8 "$pack\LEEME_PORTATIL.txt" @(
+            "OpenGuard Antivirus - version portatil",
+            "",
+            "1. Descomprima esta carpeta en un lugar fijo (por ejemplo C:\OpenGuard). No la ejecute desde dentro del .zip.",
+            "2. Ejecute openguard_gui.exe (pide permisos de administrador).",
+            "3. Para la proteccion en tiempo real use Configuracion > Activar proteccion.",
+            "",
+            "Si Windows muestra 'Windows protegio su PC': Mas informacion > Ejecutar de todas formas.",
+            "Para instalarlo con servicio, inicio automatico y desinstalador use el instalador OpenGuard_Setup."
+          )
+          Compress-Archive -Path "dist\portable\OpenGuard" -DestinationPath $zip -CompressionLevel Optimal
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "$hash  OpenGuard_Portable.zip" | Set-Content -Encoding ascii "$zip.sha256"
           Write-Host "Portatil: $zip SHA-256 $hash"
