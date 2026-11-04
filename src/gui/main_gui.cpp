@@ -56,7 +56,7 @@ using std::max;
 #include <uxtheme.h>
 
 #ifndef OPENGUARD_VERSION
-#define OPENGUARD_VERSION "0.4.4"
+#define OPENGUARD_VERSION "0.4.5"
 #endif
 
 #pragma comment(lib, "comctl32.lib")
