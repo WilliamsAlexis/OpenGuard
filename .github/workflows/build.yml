@@ -21,6 +21,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Comprobar que la etiqueta coincide con la version del codigo
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $cmake = Get-Content CMakeLists.txt -Raw
+          if ($cmake -notmatch '(?s)project\(\s*OpenGuard\s+VERSION\s+(\d+\.\d+\.\d+)') { throw "No se pudo leer la version de CMakeLists.txt" }
+          if ($Matches[1] -ne $tag) { throw "La etiqueta v$tag no coincide con la version del codigo ($($Matches[1])). Suba la version en CMakeLists.txt, installer.iss, main_cli.cpp, main_gui.cpp, el .rc y el .manifest antes de crear la etiqueta." }
+
       - name: Integrar vcpkg
         run: |
           vcpkg integrate install

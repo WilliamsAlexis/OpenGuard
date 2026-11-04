@@ -56,7 +56,7 @@ using std::max;
 #include <uxtheme.h>
 
 #ifndef OPENGUARD_VERSION
-#define OPENGUARD_VERSION "0.4.1"
+#define OPENGUARD_VERSION "0.4.4"
 #endif
 
 #pragma comment(lib, "comctl32.lib")
@@ -1724,9 +1724,12 @@ void startAppInstall() {
     g.appThread = std::thread([info]() {
         auto* res = new DownloadResult();
         try {
-            wchar_t tmp[MAX_PATH]{};
-            GetTempPathW(MAX_PATH, tmp);
-            const fs::path dest = fs::path(tmp) / fs::path(W(info.installerName.empty() ? std::string("OpenGuard_Setup.exe") : info.installerName));
+            // No se descarga en Temp: el servicio vigila esa carpeta y podia aislar el instalador (sin firma digital)
+            // antes de ejecutarlo. ProgramData\OpenGuard\updates no se vigila y solo la escribe un administrador.
+            const fs::path dir = openguard::paths::dataDir() / L"updates";
+            std::error_code mkec;
+            fs::create_directories(dir, mkec);
+            const fs::path dest = dir / fs::path(W(info.installerName.empty() ? std::string("OpenGuard_Setup.exe") : info.installerName));
             std::string err;
             res->ok = openguard::downloadInstaller(info, dest, err);
             res->path = dest.wstring();
@@ -1751,11 +1754,20 @@ void onAppDownloadDone(DownloadResult* res) {
     g.appMsg = L"Instalador descargado y verificado.";
     if (MessageBoxW(g.main, L"El instalador se descargo y su integridad fue verificada.\n\nOpenGuard se cerrara para actualizarse. Continuar?",
                     L"Actualizar OpenGuard", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-        if (reinterpret_cast<INT_PTR>(ShellExecuteW(g.main, L"open", owned->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32) {
-            PostMessageW(g.main, WM_CLOSE, 0, 0);
-        } else {
-            MessageBoxW(g.main, (L"No se pudo iniciar el instalador. Puede ejecutarlo manualmente desde:\n" + owned->path).c_str(),
+        std::error_code ec;
+        if (!fs::exists(owned->path, ec)) {
+            MessageBoxW(g.main, (L"El instalador ya no esta en:\n" + owned->path +
+                                 L"\n\nPudo ser eliminado o aislado por otro programa de seguridad. Descarguelo de nuevo o desde la pagina de versiones de GitHub.").c_str(),
                         L"OpenGuard", MB_OK | MB_ICONWARNING);
+        } else {
+            const INT_PTR rc = reinterpret_cast<INT_PTR>(ShellExecuteW(g.main, L"open", owned->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+            if (rc > 32) {
+                PostMessageW(g.main, WM_CLOSE, 0, 0);
+            } else {
+                MessageBoxW(g.main, (L"No se pudo iniciar el instalador (codigo " + std::to_wstring(static_cast<long long>(rc)) +
+                                     L"). Puede ejecutarlo manualmente desde:\n" + owned->path).c_str(),
+                            L"OpenGuard", MB_OK | MB_ICONWARNING);
+            }
         }
     }
     InvalidateRect(g.main, nullptr, FALSE);
