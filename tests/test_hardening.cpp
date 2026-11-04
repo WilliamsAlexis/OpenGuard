@@ -8,6 +8,11 @@
 #include "openguard/quarantine.h"
 #include "openguard/settings.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -43,14 +48,15 @@ TEST_F(HardeningFixture, SettingsRoundTripAndDefaults) {
 
     // Sin archivo: valores predeterminados
     auto defaults = openguard::ProtectionSettings::load(ini);
-    EXPECT_TRUE(defaults.autoQuarantine);
+    EXPECT_EQ(defaults.threatAction, "ask");
+    EXPECT_FALSE(defaults.autoQuarantine);
     EXPECT_TRUE(defaults.decoys);
     EXPECT_TRUE(defaults.scanUsb);
     EXPECT_EQ(defaults.cpuPercent, 50);
     EXPECT_TRUE(defaults.exclusions.empty());
 
     openguard::ProtectionSettings s;
-    s.autoQuarantine = false;
+    s.threatAction = "quarantine";
     s.usbMode = "off"; // scanUsb se deriva de usbMode al cargar
     s.scanUsb = false;
     s.cpuPercent = 25;
@@ -58,7 +64,8 @@ TEST_F(HardeningFixture, SettingsRoundTripAndDefaults) {
     ASSERT_TRUE(s.save(ini));
 
     auto loaded = openguard::ProtectionSettings::load(ini);
-    EXPECT_FALSE(loaded.autoQuarantine);
+    EXPECT_EQ(loaded.threatAction, "quarantine");
+    EXPECT_TRUE(loaded.autoQuarantine);
     EXPECT_TRUE(loaded.decoys);
     EXPECT_FALSE(loaded.scanUsb);
     EXPECT_EQ(loaded.cpuPercent, 25);
@@ -69,6 +76,18 @@ TEST_F(HardeningFixture, SettingsRoundTripAndDefaults) {
     s.exclusions.resize(1);
     ASSERT_TRUE(s.save(ini));
     EXPECT_EQ(openguard::ProtectionSettings::load(ini).exclusions.size(), 1u);
+}
+
+TEST_F(HardeningFixture, ThreatActionDerivesFromLegacyAutoQuarantine) {
+    const fs::path ini = m_dir / "legacy.ini";
+    ASSERT_TRUE(WritePrivateProfileStringW(L"service", L"auto_quarantine", L"1", ini.c_str()));
+    EXPECT_EQ(openguard::ProtectionSettings::load(ini).threatAction, "quarantine");
+
+    // Si existe threat_action, manda sobre auto_quarantine
+    ASSERT_TRUE(WritePrivateProfileStringW(L"service", L"threat_action", L"report", ini.c_str()));
+    const auto s = openguard::ProtectionSettings::load(ini);
+    EXPECT_EQ(s.threatAction, "report");
+    EXPECT_FALSE(s.autoQuarantine);
 }
 
 TEST_F(HardeningFixture, SettingsCpuLimitMapsToThreads) {

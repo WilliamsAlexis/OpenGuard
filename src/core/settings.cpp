@@ -35,7 +35,18 @@ ProtectionSettings ProtectionSettings::load(const std::filesystem::path& iniPath
     const std::wstring f = ini.wstring();
 
     ProtectionSettings s;
-    s.autoQuarantine = GetPrivateProfileIntW(L"service", L"auto_quarantine", 1, f.c_str()) != 0;
+    {
+        // threat_action manda; si no existe (instalaciones anteriores) se deriva de auto_quarantine
+        wchar_t ta[16]{};
+        GetPrivateProfileStringW(L"service", L"threat_action", L"", ta, 16, f.c_str());
+        const std::wstring t(ta);
+        if (t == L"ask" || t == L"quarantine" || t == L"report") {
+            s.threatAction = std::string(t.begin(), t.end());
+        } else {
+            s.threatAction = GetPrivateProfileIntW(L"service", L"auto_quarantine", 0, f.c_str()) != 0 ? "quarantine" : "ask";
+        }
+        s.autoQuarantine = (s.threatAction == "quarantine");
+    }
     s.decoys = GetPrivateProfileIntW(L"service", L"decoys", 1, f.c_str()) != 0;
     s.scanUsb = GetPrivateProfileIntW(L"service", L"scan_usb", 1, f.c_str()) != 0;
     {
@@ -97,7 +108,9 @@ bool ProtectionSettings::save(const std::filesystem::path& iniPath) const {
     auto put =[&](const wchar_t* sec, const wchar_t* key, const std::wstring& val) {
         ok = WritePrivateProfileStringW(sec, key, val.c_str(), f.c_str()) && ok;
     };
-    put(L"service", L"auto_quarantine", autoQuarantine ? L"1" : L"0");
+    const std::string action = (threatAction == "quarantine" || threatAction == "report") ? threatAction : "ask";
+    put(L"service", L"threat_action", std::wstring(action.begin(), action.end()));
+    put(L"service", L"auto_quarantine", action == "quarantine" ? L"1" : L"0");
     put(L"service", L"decoys", decoys ? L"1" : L"0");
     const std::string mode = (usbMode == "auto" || usbMode == "off") ? usbMode : "ask";
     put(L"service", L"scan_usb", mode != "off" ? L"1" : L"0");

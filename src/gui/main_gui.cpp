@@ -39,6 +39,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -90,11 +91,11 @@ constexpr COLORREF C_SIDE_TEXT = RGB(150, 163, 190);
 
 // ----------------------------------------------------------------------------- ids y mensajes
 
-enum Page { PG_HOME, PG_SCAN, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE, PG_FEEDS }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
+enum Page { PG_HOME, PG_SCAN, PG_THREATS, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE, PG_FEEDS }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
-    NAV_SCAN = NAV_BASE + 1, NAV_UPDATE = NAV_BASE + 2, NAV_QUARANTINE = NAV_BASE + 3,  // = NAV_BASE + PG_UPDATE / PG_QUARANTINE
+    NAV_SCAN = NAV_BASE + 1, NAV_THREATS = NAV_BASE + 2, NAV_UPDATE = NAV_BASE + 3, NAV_QUARANTINE = NAV_BASE + 4,  // = NAV_BASE + PG_xxx
     ID_SCAN_QUICK = 200, ID_SCAN_FULL, ID_SCAN_FOLDER, ID_CANCEL, ID_ISOLATE,
     ID_UPDATE_NOW, ID_IMPORT_FILE, ID_Q_RESTORE, ID_Q_DELETE, ID_Q_REFRESH,
     ID_LOG_OPEN, ID_LOG_REFRESH, ID_TOGGLE_PROTECTION, ID_SAVE_SETTINGS, ID_FIX,
@@ -103,7 +104,8 @@ enum : int {
     ID_EXCL_OPEN, ID_EXCL_ADD_DIR, ID_EXCL_ADD_FILE, ID_EXCL_REMOVE, ID_EXCL_BACK,
     ID_SCHED_OPEN, ID_SCHED_BACK, ID_SCHED_SAVE, ID_SCHED_QUICK, ID_SCHED_FULL, ID_SCHED_DAILY, ID_SCHED_WEEKLY,
     ID_SCHED_HOUR_UP, ID_SCHED_HOUR_DOWN, ID_SCHED_MIN_UP, ID_SCHED_MIN_DOWN, ID_SCHED_DAY_NEXT,
-    ID_USB_MODE,
+    ID_USB_MODE, ID_THREAT_MODE,
+    ID_THREAT_ISOLATE, ID_THREAT_DELETE, ID_THREAT_IGNORE, ID_THREAT_OPEN, ID_THREAT_ALL,
     ID_FEEDS_OPEN, ID_FEEDS_BACK, ID_FEEDS_SAVE, ID_FEEDS_RUN, ID_FEED_HOURS, ID_FEED_KEY_PASTE, ID_FEED_KEY_REMOVE,
     TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED, TOG_DOWNLOADS, TOG_TRAY, TOG_AUTOSTART, TOG_AUTOUPD, TOG_FEEDRULES, TOG_BAZAAR
 };
@@ -164,6 +166,7 @@ struct AppState {
     Svc svc{Svc::NotInstalled};
     size_t sigCount{0}, yaraCount{0}, quarantineCount{0};
     std::vector<openguard::ScanResult> threats;
+    std::vector<openguard::HistoryEvent> pending;       // amenazas detectadas aun sin resolver (del historial)
     std::vector<openguard::QuarantineItem> quarantined;
     std::wstring scanStatus, updateMsg;
     bool updateOk{true};
@@ -264,7 +267,6 @@ void loadSettings() {
 }
 
 bool saveSettings() {
-    g.prot.autoQuarantine = g.settings.autoQuarantine;
     g.prot.decoys = g.settings.decoys;
     g.prot.scanDownloads = g.settings.scanDownloads;
     iniSetStr(guiIni(), L"gui", L"close_to_tray", g.settings.closeToTray ? L"1" : L"0");
@@ -468,13 +470,26 @@ const wchar_t* kDriveMeasures =
     L"\x2022 Si las amenazas reaparecen, copie sus documentos a un lugar seguro y formatee la unidad.\n"
     L"\x2022 Ejecute tambien un analisis completo del equipo.";
 
-void isolateAllThreats(int& ok, int& fail) {
+/// Archivos dentro de la carpeta de Windows: aislarlos o borrarlos puede dejar el sistema sin arrancar.
+bool isProtectedSystemPath(const fs::path& p) {
+    wchar_t win[MAX_PATH]{};
+    if (!GetWindowsDirectoryW(win, MAX_PATH)) return false;
+    std::wstring a = p.lexically_normal().wstring();
+    std::wstring b = fs::path(win).lexically_normal().wstring();
+    for (auto& c : a) c = static_cast<wchar_t>(towlower(c));
+    for (auto& c : b) c = static_cast<wchar_t>(towlower(c));
+    if (!b.empty() && b.back() != L'\\') b += L'\\';
+    return a.rfind(b, 0) == 0;
+}
+
+void isolateAllThreats(int& ok, int& fail, const char* reason = "unidad externa") {
     ok = 0;
     fail = 0;
     try {
         openguard::QuarantineVault vault(openguard::paths::quarantineDir());
         for (auto it = g.threats.begin(); it != g.threats.end();) {
             const auto& first = it->threats.front();
+            if (isProtectedSystemPath(it->filePath)) { ++fail; ++it; continue; }
             if (vault.quarantineFile(it->filePath, first.name, first.severity, it->sha256)) {
                 ++ok;
                 if (g.history) {
@@ -483,7 +498,7 @@ void isolateAllThreats(int& ok, int& fail) {
                     e.level = "ACTION";
                     e.path = openguard::paths::toUtf8(it->filePath);
                     e.threat = first.name;
-                    e.action = "aislado en cuarentena (unidad externa)";
+                    e.action = std::string("aislado en cuarentena (") + reason + ")";
                     e.sha256 = it->sha256;
                     g.history->record(e);
                 }
@@ -942,6 +957,35 @@ void fillThreatList() {
     }
 }
 
+/// Amenazas detectadas (historial) cuyo archivo sigue en su sitio y no esta excluido: lo que falta resolver.
+void loadPendingThreats() {
+    g.pending.clear();
+    if (!g.history) return;
+    std::set<std::wstring> seen;
+    for (const auto& e : g.history->recent(3000, "detection")) {
+        if (e.path.empty()) continue;
+        const fs::path p = openguard::paths::fromUtf8(e.path);
+        std::wstring key = p.lexically_normal().wstring();
+        for (auto& c : key) c = static_cast<wchar_t>(towlower(c));
+        if (!seen.insert(key).second) continue; // solo la deteccion mas reciente de cada archivo
+        std::error_code ec;
+        if (!fs::is_regular_file(p, ec)) continue; // ya aislado, eliminado o movido
+        if (g.prot.isExcluded(p)) continue;
+        g.pending.push_back(e);
+    }
+}
+
+void fillPendingList() {
+    ListView_DeleteAllItems(g.list);
+    setColumns({{L"Archivo", 430}, {L"Amenaza", 250}, {L"Riesgo", 100}, {L"Detectada", 150}});
+    int row = 0;
+    for (const auto& e : g.pending) {
+        std::wstring risk = W(e.details);
+        if (risk.rfind(L"riesgo ", 0) == 0) risk.erase(0, 7);
+        addRow(row++, {W(e.path), W(e.threat), risk, W(e.timestamp)});
+    }
+}
+
 void fillQuarantineList() {
     try {
         openguard::QuarantineVault vault(openguard::paths::quarantineDir());
@@ -1021,6 +1065,8 @@ void layoutControls() {
         listTop = body.top + S(100) + S(16) + S(30) + S(22);
     } else if (g.page == PG_QUARANTINE || g.page == PG_REPORTS || g.page == PG_EXCLUSIONS) {
         showList = true;
+    } else if (g.page == PG_THREATS) {
+        showList = !g.pending.empty(); // sin amenazas se dibuja un mensaje en su lugar
     }
 
     ShowWindow(g.list, showList ? SW_SHOW : SW_HIDE);
@@ -1033,6 +1079,7 @@ void showPage(Page p) {
     g.page = p;
     refreshData();
     if (p == PG_SCAN) fillThreatList();
+    else if (p == PG_THREATS) { loadPendingThreats(); fillPendingList(); }
     else if (p == PG_QUARANTINE) fillQuarantineList();
     else if (p == PG_REPORTS) fillReportList();
     else if (p == PG_SETTINGS) { loadSettings(); g.settingsScroll = 0; }
@@ -1127,6 +1174,10 @@ void onScanDone(openguard::ScanSessionStats* stats) {
             g.history->record(e);
         }
     }
+    // Accion elegida por el usuario ante amenazas: "quarantine" las aisla al terminar el analisis
+    int autoIsolated = 0, autoFailed = 0;
+    if (g.prot.threatAction == "quarantine" && !g.threats.empty()) isolateAllThreats(autoIsolated, autoFailed, "analisis manual");
+    loadPendingThreats();
     if (g.page == PG_SCAN) fillThreatList();
 
     g.scanStatus = L"Completado: " + std::to_wstring(owned->filesScanned) + L" archivos analizados, " +
@@ -1139,8 +1190,11 @@ void onScanDone(openguard::ScanSessionStats* stats) {
         iniSetStr(guiIni(), L"stats", L"total_scanned", std::to_wstring(static_cast<size_t>(prevTotal) + owned->filesScanned));
     }
     g.homeCacheTick = 0; // fuerza recalcular las cifras de la pantalla de inicio
-    if (owned->threatsFound > 0) {
-        pushToast(L"Analisis completado: " + std::to_wstring(owned->threatsFound) + L" amenazas encontradas", C_BAD, 6000);
+    if (autoIsolated > 0 || autoFailed > 0) {
+        pushToast(L"Analisis completado: " + std::to_wstring(autoIsolated) + L" amenazas aisladas" +
+                  (autoFailed ? L", " + std::to_wstring(autoFailed) + L" sin resolver (ver Amenazas)" : L""), autoFailed ? C_WARN : C_OK, 6500);
+    } else if (owned->threatsFound > 0) {
+        pushToast(L"Analisis completado: " + std::to_wstring(owned->threatsFound) + L" amenazas encontradas. Elija que hacer en Amenazas.", C_BAD, 6500);
     } else {
         pushToast(L"Analisis completado: " + std::to_wstring(owned->filesScanned) + L" archivos, sin amenazas", C_OK);
     }
@@ -1149,6 +1203,9 @@ void onScanDone(openguard::ScanSessionStats* stats) {
     InvalidateRect(g.main, nullptr, FALSE);
 
     // Análisis de una unidad externa: se muestran las medidas y acciones; luego se sigue con la cola de unidades
+    if (g.prot.threatAction == "ask" && owned->threatsFound > 0 && g.driveRoot.empty() && g.page == PG_SCAN && !g.pending.empty()) {
+        showPage(PG_THREATS); // el usuario eligio decidir: se le lleva a la lista de amenazas
+    }
     if (!g.driveRoot.empty()) {
         finishDriveScan();
         startNextPendingDrive();
@@ -1193,6 +1250,100 @@ void isolateSelected() {
     if (fail) msg += L"\n\nCierre el programa que usa el archivo e intentelo de nuevo.";
     MessageBoxW(g.main, msg.c_str(), L"Cuarentena", MB_OK | (fail ? MB_ICONWARNING : MB_ICONINFORMATION));
     InvalidateRect(g.main, nullptr, FALSE);
+}
+
+void restartProtectionIfRunning();
+
+/// Acciones sobre las amenazas pendientes seleccionadas: aislar, eliminar o ignorar (excluir).
+enum class ThreatOp { Isolate, Delete, Ignore };
+
+void pendingAction(ThreatOp op) {
+    const auto rows = selectedRows();
+    if (rows.empty()) {
+        MessageBoxW(g.main, L"Seleccione una o varias amenazas de la lista (Ctrl o Mayus para varias, o \"Seleccionar todo\").",
+                    L"OpenGuard", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring count = std::to_wstring(rows.size());
+    if (op == ThreatOp::Delete &&
+        MessageBoxW(g.main, (L"Se eliminaran de forma permanente " + count + L" archivo(s). No se podran recuperar. Continuar?").c_str(),
+                    L"Eliminar", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    if (op == ThreatOp::Ignore &&
+        MessageBoxW(g.main, (L"OpenGuard dejara de analizar " + count + L" archivo(s) y no volvera a avisar de ellos. "
+                             L"Hagalo solo si esta seguro de que son legitimos. Continuar?").c_str(),
+                    L"Ignorar", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+
+    int ok = 0, fail = 0, skippedSystem = 0;
+    bool exclusionsChanged = false;
+    try {
+        openguard::QuarantineVault vault(openguard::paths::quarantineDir());
+        for (int row : rows) {
+            if (row < 0 || static_cast<size_t>(row) >= g.pending.size()) continue;
+            const auto& e = g.pending[static_cast<size_t>(row)];
+            const fs::path p = openguard::paths::fromUtf8(e.path);
+            if (op != ThreatOp::Ignore && isProtectedSystemPath(p)) { ++skippedSystem; continue; }
+
+            openguard::HistoryEvent h;
+            h.level = "ACTION";
+            h.path = e.path;
+            h.threat = e.threat;
+            h.sha256 = e.sha256;
+            bool done = false;
+            if (op == ThreatOp::Isolate) {
+                done = static_cast<bool>(vault.quarantineFile(p, e.threat.empty() ? "Amenaza.Desconocida" : e.threat, "high", e.sha256));
+                h.kind = "quarantine";
+                h.action = "aislado en cuarentena (elegido por el usuario)";
+            } else if (op == ThreatOp::Delete) {
+                std::error_code ec;
+                done = fs::remove(p, ec) && !ec;
+                h.kind = "delete";
+                h.action = "eliminado (elegido por el usuario)";
+            } else {
+                if (!g.prot.isExcluded(p)) { g.prot.exclusions.push_back(p); exclusionsChanged = true; }
+                done = true;
+                h.kind = "ignored";
+                h.action = "ignorado por el usuario (excluido del analisis)";
+            }
+            if (done) {
+                ++ok;
+                if (g.history) g.history->record(h);
+            } else {
+                ++fail;
+            }
+        }
+    } catch (...) { fail = static_cast<int>(rows.size()) - ok; }
+
+    if (exclusionsChanged) {
+        if (g.prot.save()) restartProtectionIfRunning();
+        else MessageBoxW(g.main, L"No se pudo guardar la exclusion (ejecute OpenGuard como Administrador).", L"OpenGuard", MB_OK | MB_ICONWARNING);
+    }
+
+    loadPendingThreats();
+    fillPendingList();
+    layoutControls();
+    g.homeCacheTick = 0;
+    refreshData();
+
+    std::wstring msg = std::to_wstring(ok) + L" resuelta(s)";
+    if (fail) msg += L", " + std::to_wstring(fail) + L" con error (archivo en uso o sin permisos: cierre el programa que lo usa e intentelo de nuevo)";
+    if (skippedSystem) msg += L".\n" + std::to_wstring(skippedSystem) + L" estan en la carpeta de Windows y no se tocaron: si cree que es un falso positivo use \"Ignorar\"";
+    MessageBoxW(g.main, (msg + L".").c_str(), L"Amenazas", MB_OK | ((fail || skippedSystem) ? MB_ICONWARNING : MB_ICONINFORMATION));
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
+void openPendingLocation() {
+    const auto rows = selectedRows();
+    if (rows.empty() || static_cast<size_t>(rows.front()) >= g.pending.size()) {
+        MessageBoxW(g.main, L"Seleccione una amenaza de la lista.", L"OpenGuard", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring args = L"/select,\"" + openguard::paths::fromUtf8(g.pending[static_cast<size_t>(rows.front())].path).wstring() + L"\"";
+    ShellExecuteW(g.main, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void selectAllRows() {
+    ListView_SetItemState(g.list, -1, LVIS_SELECTED, LVIS_SELECTED);
+    SetFocus(g.list);
 }
 
 void quarantineAction(bool restore) {
@@ -1600,8 +1751,8 @@ void paintSidebar(HDC hdc, int h) {
     text(hdc, L"OPENGUARD", R(S(72), S(22), sw - S(8), S(46)), g.fH2, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     text(hdc, L"A N T I V I R U S", R(S(72), S(46), sw - S(8), S(66)), g.fSmall, C_ACCENT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
-    static const wchar_t* names[PG_COUNT] = {L"Inicio", L"Analisis", L"Actualizacion", L"Cuarentena", L"Informes", L"Configuracion"};
-    static const wchar_t* glyphs[PG_COUNT] = {L"\xE80F", L"\xE721", L"\xE895", L"\xE72E", L"\xE8A5", L"\xE713"};
+    static const wchar_t* names[PG_COUNT] = {L"Inicio", L"Analisis", L"Amenazas", L"Actualizacion", L"Cuarentena", L"Informes", L"Configuracion"};
+    static const wchar_t* glyphs[PG_COUNT] = {L"\xE80F", L"\xE721", L"\xE7BA", L"\xE895", L"\xE72E", L"\xE8A5", L"\xE713"};
     int y = S(104);
     for (int i = 0; i < PG_COUNT; ++i) {
         RECT item = R(S(10), y, sw - S(10), y + S(46));
@@ -1678,6 +1829,7 @@ void refreshHomeCache() {
     if (!g.history) return;
     g.threatsBlocked = g.history->count("quarantine");
     g.threatsDetected = g.history->count("detection");
+    loadPendingThreats();
     g.feed = g.history->recent(6);
 
     // Detecciones de los últimos 7 días (día de calendario local)
@@ -1785,7 +1937,9 @@ void paintHome(HDC hdc, int w, int h) {
         addHit(rc, id);
     };
     stat(0, L"ARCHIVOS ANALIZADOS", std::to_wstring(g.totalScanned), L"Ultimo analisis: " + g.lastScanText, C_ACCENT, NAV_SCAN);
-    stat(1, L"AMENAZAS BLOQUEADAS", std::to_wstring(g.threatsBlocked), L"Detectadas en total: " + std::to_wstring(g.threatsDetected), C_BAD, NAV_QUARANTINE);
+    stat(1, L"AMENAZAS PENDIENTES", std::to_wstring(g.pending.size()),
+         L"Aisladas: " + std::to_wstring(g.threatsBlocked) + L"  |  Detectadas: " + std::to_wstring(g.threatsDetected) +
+         (g.pending.empty() ? L"" : L"  -  pulse para revisar"), g.pending.empty() ? C_OK : C_BAD, NAV_THREATS);
     stat(2, L"FIRMAS DE AMENAZAS", std::to_wstring(g.sigCount), L"Actualizado: " + g.lastUpdateText, C_VIOLET, NAV_UPDATE);
 
     // ---- Actividad en vivo y gráfico de detecciones
@@ -1941,6 +2095,33 @@ void paintUpdate(HDC hdc, int w, int h) {
          R(body.left, app.bottom + S(10), body.right, body.bottom + S(30)), g.fSmall, C_MUTED);
 }
 
+void paintThreats(HDC hdc, int w, int h) {
+    pageHeader(hdc, w, L"Amenazas", L"Elija que hacer con cada amenaza detectada, una por una o varias a la vez");
+    const RECT body = bodyRect(w, h);
+    const int by = bottomButtonsTop(h);
+    if (g.pending.empty()) {
+        RECT box = R(body.left, body.top, body.right, body.top + S(120));
+        drawCard(hdc, box);
+        text(hdc, L"No hay amenazas pendientes", R(box.left + S(24), box.top + S(18), box.right - S(24), box.top + S(48)), g.fH2, C_OK, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, L"Las amenazas detectadas en los analisis aparecen aqui hasta que las aisle, elimine o ignore.",
+             R(box.left + S(24), box.top + S(54), box.right - S(24), box.bottom - S(10)), g.fBody, C_MUTED);
+    } else {
+        text(hdc, std::to_wstring(g.pending.size()) + L" amenaza(s) pendiente(s). Use Ctrl o Mayus para elegir varias.",
+             R(body.left, body.top - S(4), body.right, body.top + S(18)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    const bool any = !g.pending.empty();
+    int x = body.left;
+    auto btn = [&](int width, const wchar_t* label, int id, BtnStyle style) {
+        drawButton(hdc, R(x, by, x + S(width), by + S(40)), label, id, style, any);
+        x += S(width) + S(12);
+    };
+    btn(210, L"Aislar seleccionadas", ID_THREAT_ISOLATE, BS_PRIMARY);
+    btn(140, L"Eliminar", ID_THREAT_DELETE, BS_DANGER);
+    btn(130, L"Ignorar", ID_THREAT_IGNORE, BS_SECONDARY);
+    btn(170, L"Abrir ubicacion", ID_THREAT_OPEN, BS_SECONDARY);
+    btn(170, L"Seleccionar todo", ID_THREAT_ALL, BS_SECONDARY);
+}
+
 void paintQuarantine(HDC hdc, int w, int h) {
     pageHeader(hdc, w, L"Cuarentena", L"Archivos aislados en la boveda cifrada (AES-256)");
     const RECT body = bodyRect(w, h);
@@ -1967,16 +2148,15 @@ void paintSettings(HDC hdc, int w, int h) {
     struct Row { const wchar_t* title; const wchar_t* desc; bool* value; int id; };
     Row rows[] = {
         {L"Analizar archivos descargados", L"Analiza cada archivo nuevo de Descargas al terminar de bajar y lo aisla si es una amenaza confirmada.", &g.settings.scanDownloads, TOG_DOWNLOADS},
-        {L"Aislar amenazas confirmadas automaticamente", L"Mueve a cuarentena lo que coincide con una firma o tiene riesgo critico.", &g.settings.autoQuarantine, TOG_AUTOQ},
         {L"Archivos senuelo anti-ransomware", L"Crea archivos ocultos en Documentos y Escritorio y alerta si los modifican.", &g.settings.decoys, TOG_DECOY},
         {L"Ejecutar en segundo plano al cerrar la ventana", L"OpenGuard sigue en la bandeja del sistema avisando de amenazas y unidades nuevas (recomendado).", &g.settings.closeToTray, TOG_TRAY},
         {L"Iniciar con Windows en segundo plano", L"Abre OpenGuard al iniciar sesion, sin ventana y con su icono en la bandeja.", &g.settings.autostart, TOG_AUTOSTART},
         {L"Mostrar notificaciones en la bandeja", L"Avisa cuando se detecta o aisla una amenaza.", &g.settings.notify, TOG_NOTIFY},
         {L"Buscar actualizaciones del programa", L"Comprueba en GitHub si hay una version nueva de OpenGuard al abrir la aplicacion.", &g.settings.checkAppUpdates, TOG_APPUPD},
     };
-    constexpr int kToggleRows = 7;
+    constexpr int kToggleRows = 6;
     const int rowH = S(60);
-    const int totalRows = kToggleRows + 2; // + unidades externas + CPU
+    const int totalRows = kToggleRows + 3; // + accion ante amenazas + unidades externas + CPU
     const int contentH = rowH * totalRows + S(8) + S(14) + S(72);
 
     const int viewH = view.bottom - view.top;
@@ -1997,6 +2177,19 @@ void paintSettings(HDC hdc, int w, int h) {
         text(hdc, r.title, R(card.left + S(22), y + S(8), card.right - S(100), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         text(hdc, r.desc, R(card.left + S(22), y + S(30), card.right - S(100), y + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         drawToggle(hdc, card.right - S(76), y + (rowH - S(24)) / 2, *r.value, r.id);
+        y += rowH;
+        fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
+    }
+
+    // Accion ante una amenaza: preguntar / aislar automaticamente / solo avisar
+    {
+        text(hdc, L"Que hacer ante una amenaza", R(card.left + S(22), y + S(8), card.right - S(250), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        const wchar_t* desc = g.prot.threatAction == "quarantine" ? L"Se aislan solas en cuarentena (analisis, tiempo real y descargas). Se pueden restaurar."
+                            : g.prot.threatAction == "report"     ? L"Solo se registran y avisan; no se modifica ningun archivo."
+                                                                  : L"Se listan en Amenazas y usted decide: aislar, eliminar o ignorar, una por una o varias a la vez.";
+        text(hdc, desc, R(card.left + S(22), y + S(30), card.right - S(250), y + rowH - S(2)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        const wchar_t* label = g.prot.threatAction == "quarantine" ? L"Aislar solas" : g.prot.threatAction == "report" ? L"Solo avisar" : L"Preguntarme";
+        drawButton(hdc, R(card.right - S(190), y + S(10), card.right - S(20), y + S(10) + S(38)), label, ID_THREAT_MODE, BS_SECONDARY);
         y += rowH;
         fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
     }
@@ -2218,6 +2411,7 @@ void paintAll(HDC hdc, int w, int h) {
     switch (g.page) {
         case PG_HOME:       paintHome(hdc, w, h); break;
         case PG_SCAN:       paintScan(hdc, w, h); break;
+        case PG_THREATS:    paintThreats(hdc, w, h); break;
         case PG_UPDATE:     paintUpdate(hdc, w, h); break;
         case PG_QUARANTINE: paintQuarantine(hdc, w, h); break;
         case PG_REPORTS:    paintReports(hdc, w, h); break;
@@ -2257,6 +2451,14 @@ void onHit(int id) {
             break;
         }
         case ID_ISOLATE: isolateSelected(); break;
+        case ID_THREAT_ISOLATE: pendingAction(ThreatOp::Isolate); break;
+        case ID_THREAT_DELETE: pendingAction(ThreatOp::Delete); break;
+        case ID_THREAT_IGNORE: pendingAction(ThreatOp::Ignore); break;
+        case ID_THREAT_OPEN: openPendingLocation(); break;
+        case ID_THREAT_ALL: selectAllRows(); break;
+        case ID_THREAT_MODE:
+            g.prot.threatAction = (g.prot.threatAction == "ask") ? "quarantine" : (g.prot.threatAction == "quarantine") ? "report" : "ask";
+            break;
         case ID_UPDATE_NOW: startUpdate(); break;
         case ID_FIX: showPage(PG_UPDATE); startUpdate(); break;
         case ID_IMPORT_FILE: importFromFile(); break;
@@ -2275,7 +2477,6 @@ void onHit(int id) {
             refreshData();
             break;
         }
-        case TOG_AUTOQ: g.settings.autoQuarantine = !g.settings.autoQuarantine; break;
         case TOG_DECOY: g.settings.decoys = !g.settings.decoys; break;
         case TOG_USB: g.settings.scanUsb = !g.settings.scanUsb; break;
         case TOG_NOTIFY: g.settings.notify = !g.settings.notify; break;

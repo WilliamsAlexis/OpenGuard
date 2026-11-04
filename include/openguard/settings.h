@@ -40,7 +40,10 @@ struct ScanSchedule {
 [[nodiscard]] std::time_t parseLocalStamp(const std::string& text);
 
 struct ProtectionSettings {
-    bool autoQuarantine{true};     ///< Aislar automáticamente lo confirmado.
+    /// Qué hacer ante una amenaza: "ask" = solo se lista y el usuario decide (aislar/eliminar/ignorar);
+    /// "quarantine" = se aísla sola; "report" = solo se registra. Es la opción que manda.
+    std::string threatAction{"ask"};
+    bool autoQuarantine{false};    ///< Derivado: true si threatAction == "quarantine" (lo lee el servicio).
     bool decoys{true};             ///< Archivos señuelo anti-ransomware.
     bool scanUsb{true};            ///< Equivale a usbMode != "off" (se conserva por compatibilidad con versiones anteriores).
     /// Unidades externas: "ask" = la aplicación pregunta si permite el análisis; "auto" = el servicio las analiza
