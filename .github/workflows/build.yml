@@ -133,6 +133,17 @@ jobs:
           "$hash  OpenGuard_Portable.zip" | Set-Content -Encoding ascii "$zip.sha256"
           Write-Host "Portatil: $zip SHA-256 $hash"
 
+      - name: Crear zip del instalador
+        run: |
+          # El mismo instalador dentro de un .zip con nombre fijo: muchos navegadores bloquean menos un .zip que un .exe suelto.
+          $setup = Get-ChildItem dist\OpenGuard_Setup_v*.exe | Select-Object -First 1
+          $zip = "dist\OpenGuard_Instalador.zip"
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path $setup.FullName -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  OpenGuard_Instalador.zip" | Set-Content -Encoding ascii "$zip.sha256"
+          Write-Host "Instalador en zip: $zip SHA-256 $hash"
+
       - name: Publicar instalador como artefacto
         uses: actions/upload-artifact@v5
         with:
@@ -140,6 +151,8 @@ jobs:
           path: |
             dist/OpenGuard_Setup_v*.exe
             dist/OpenGuard_Setup_v*.exe.sha256
+            dist/OpenGuard_Instalador.zip
+            dist/OpenGuard_Instalador.zip.sha256
             dist/OpenGuard_Portable.zip
             dist/OpenGuard_Portable.zip.sha256
           if-no-files-found: error
@@ -151,5 +164,7 @@ jobs:
           files: |
             dist/OpenGuard_Setup_v*.exe
             dist/OpenGuard_Setup_v*.exe.sha256
+            dist/OpenGuard_Instalador.zip
+            dist/OpenGuard_Instalador.zip.sha256
             dist/OpenGuard_Portable.zip
             dist/OpenGuard_Portable.zip.sha256
