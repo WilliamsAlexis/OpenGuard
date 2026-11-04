@@ -229,6 +229,7 @@ TEST(SuspiciousLocationTest, ScoresByFolderAndIgnoresSafeOnes) {
 }
 
 TEST_F(Phase1Fixture, ContentMatchesAreWeighedByContext) {
+    using openguard::HeuristicsEngine;
     int weak = 0;
     // Librerias de desarrollo: se descarta lo no critico, nunca lo critico
     EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\p\\node_modules\\x\\a.js", "yara", "high", 70, weak), -1);
