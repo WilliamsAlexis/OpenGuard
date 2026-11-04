@@ -80,6 +80,34 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File scripts/build_installer.ps1 -SkipBuild -SkipTests
 
+      - name: Firmar el instalador (solo si hay certificado configurado)
+        env:
+          CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:CERT_PFX_BASE64)) {
+            Write-Host "Sin certificado (secreto WINDOWS_CERT_PFX_BASE64): el instalador se publica SIN firma."
+            exit 0
+          }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $signtool) { throw "No se encontro signtool.exe" }
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+          try {
+            foreach ($setup in Get-ChildItem dist\OpenGuard_Setup_v*.exe) {
+              & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 /d "OpenGuard Antivirus" $setup.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signtool sign fallo" }
+              & $signtool.FullName verify /pa $setup.FullName
+              if ($LASTEXITCODE -ne 0) { throw "La firma no se pudo verificar" }
+              # El hash cambia al firmar: se regenera el .sha256
+              $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+              "$hash  $($setup.Name)" | Set-Content -Encoding ascii "$($setup.FullName).sha256"
+              Write-Host "Firmado: $($setup.Name) SHA-256 $hash"
+            }
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Publicar instalador como artefacto
         uses: actions/upload-artifact@v5
         with:
