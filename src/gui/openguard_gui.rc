@@ -16,9 +16,9 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Alexis Williams\0"
             VALUE "FileDescription", "OpenGuard Antivirus\0"
-            VALUE "FileVersion", "0.3.0\0"
+            VALUE "FileVersion", "0.4.0\0"
             VALUE "ProductName", "OpenGuard Antivirus\0"
-            VALUE "ProductVersion", "0.3.0\0"
+            VALUE "ProductVersion", "0.4.0\0"
             VALUE "LegalCopyright", "MIT License\0"
         END
     END
