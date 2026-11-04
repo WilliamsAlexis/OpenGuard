@@ -49,14 +49,23 @@ jobs:
 
       - name: Publicar log de compilacion en rama ci-logs
         if: always() && github.event_name != 'pull_request'
+        continue-on-error: true   # el log es solo una ayuda de diagnostico: nunca debe tumbar la compilacion
         run: |
           if (Test-Path build.log) {
+            # Repositorio aparte solo con build.log: la rama ci-logs no contiene .github/workflows, asi que
+            # GitHub no exige el permiso "workflows" al publicarla.
+            $tmp = Join-Path $env:RUNNER_TEMP 'cilogs'
+            New-Item -ItemType Directory -Force $tmp | Out-Null
+            Copy-Item build.log (Join-Path $tmp 'build.log') -Force
+            Push-Location $tmp
+            git init -q
+            git checkout -q -b ci-logs
             git config user.name "github-actions"
             git config user.email "github-actions@github.com"
-            git checkout -B ci-logs
-            git add build.log -f
-            git commit -m "ci: build log for run ${{ github.run_id }}"
-            git push origin ci-logs -f
+            git add build.log
+            git commit -q -m "ci: build log for run ${{ github.run_id }}"
+            git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ci-logs
+            Pop-Location
           }
 
       - name: Ejecutar pruebas unitarias automatizadas (Google Test)
