@@ -99,6 +99,20 @@ public:
      */
     [[nodiscard]] static std::optional<ThreatInfo> suspiciousLocation(const std::filesystem::path& file);
 
+    /**
+     * @brief Ajusta la confianza de una coincidencia de contenido (YARA o heurística de script) según el archivo.
+     * @details Las reglas buscan cadenas típicas de malware (APIs de teclado, "exec", sockets...) que aparecen en el
+     *          código fuente de cualquier librería. Por eso:
+     *          - dentro de carpetas de librerías/desarrollo (node_modules, site-packages, .git...) lo no crítico se descarta;
+     *          - una coincidencia YARA no crítica en archivos de texto/código (.js, .json, .md...) solo pesa un poco
+     *            (la primera 10 puntos, el resto 0), insuficiente por sí sola para considerarlo amenaza.
+     *          Las coincidencias críticas y las firmas por hash nunca se alteran.
+     * @param weakSeen Contador por archivo de coincidencias débiles ya aplicadas (empezar en 0).
+     * @return Puntuación a usar, o -1 si debe descartarse.
+     */
+    [[nodiscard]] static int weighContentMatch(const std::filesystem::path& file, const std::string& method,
+                                               const std::string& severity, int score, int& weakSeen);
+
 private:
     std::unique_ptr<PEAnalyzer> m_peAnalyzer;
     std::unique_ptr<ScriptAnalyzer> m_scriptAnalyzer;

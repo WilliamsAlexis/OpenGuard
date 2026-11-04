@@ -27,6 +27,7 @@ add_library(openguard_core STATIC
     update_verify.cpp
     secrets.cpp
     feeds.cpp
+    cleaner.cpp
 )
 
 target_include_directories(openguard_core PUBLIC

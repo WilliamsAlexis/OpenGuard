@@ -228,6 +228,23 @@ TEST(SuspiciousLocationTest, ScoresByFolderAndIgnoresSafeOnes) {
     EXPECT_FALSE(HeuristicsEngine::suspiciousLocation(L"C:\\Users\\Ana\\Documents\\app.exe").has_value());
 }
 
+TEST_F(Phase1Fixture, ContentMatchesAreWeighedByContext) {
+    int weak = 0;
+    // Librerias de desarrollo: se descarta lo no critico, nunca lo critico
+    EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\p\\node_modules\\x\\a.js", "yara", "high", 70, weak), -1);
+    EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\p\\node_modules\\x\\a.js", "yara", "critical", 85, weak), 85);
+
+    // Texto/codigo fuera de librerias: la primera coincidencia pesa 10, las siguientes 0
+    weak = 0;
+    EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\Temp\\app.js", "yara", "high", 70, weak), 10);
+    EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\Temp\\app.js", "yara", "high", 70, weak), 0);
+
+    // Binarios y firmas por hash no se alteran
+    weak = 0;
+    EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\Temp\\app.exe", "yara", "high", 70, weak), 70);
+    EXPECT_EQ(HeuristicsEngine::weighContentMatch(L"C:\\Temp\\app.js", "hash_signature", "high", 80, weak), 80);
+}
+
 TEST_F(Phase1Fixture, LocationAloneNeverReachesThreatThreshold) {
     const fs::path tempExe = m_dir / "AppData" / "Local" / "Temp" / "algo.vbs";
     fs::create_directories(tempExe.parent_path());

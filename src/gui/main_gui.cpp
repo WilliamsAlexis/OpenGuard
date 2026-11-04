@@ -11,6 +11,8 @@
 #include "openguard/scanner.h"
 #include "openguard/signatures.h"
 #include "openguard/app_update.h"
+#include "openguard/cleaner.h"
+#include "openguard/heuristics.h"
 #include "openguard/drive_tools.h"
 #include "openguard/feeds.h"
 #include "openguard/secrets.h"
@@ -54,7 +56,7 @@ using std::max;
 #include <uxtheme.h>
 
 #ifndef OPENGUARD_VERSION
-#define OPENGUARD_VERSION "0.4.0"
+#define OPENGUARD_VERSION "0.4.1"
 #endif
 
 #pragma comment(lib, "comctl32.lib")
@@ -91,11 +93,11 @@ constexpr COLORREF C_SIDE_TEXT = RGB(150, 163, 190);
 
 // ----------------------------------------------------------------------------- ids y mensajes
 
-enum Page { PG_HOME, PG_SCAN, PG_THREATS, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE, PG_FEEDS }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
+enum Page { PG_HOME, PG_SCAN, PG_THREATS, PG_CLEANER, PG_UPDATE, PG_QUARANTINE, PG_REPORTS, PG_SETTINGS, PG_COUNT, PG_EXCLUSIONS, PG_SCHEDULE, PG_FEEDS }; // PG_EXCLUSIONS y PG_SCHEDULE: subpáginas sin entrada en el menú
 
 enum : int {
     NAV_BASE = 100,                       // NAV_BASE + Page
-    NAV_SCAN = NAV_BASE + 1, NAV_THREATS = NAV_BASE + 2, NAV_UPDATE = NAV_BASE + 3, NAV_QUARANTINE = NAV_BASE + 4,  // = NAV_BASE + PG_xxx
+    NAV_SCAN = NAV_BASE + 1, NAV_THREATS = NAV_BASE + 2, NAV_CLEANER = NAV_BASE + 3, NAV_UPDATE = NAV_BASE + 4, NAV_QUARANTINE = NAV_BASE + 5,  // = NAV_BASE + PG_xxx
     ID_SCAN_QUICK = 200, ID_SCAN_FULL, ID_SCAN_FOLDER, ID_CANCEL, ID_ISOLATE,
     ID_UPDATE_NOW, ID_IMPORT_FILE, ID_Q_RESTORE, ID_Q_DELETE, ID_Q_REFRESH,
     ID_LOG_OPEN, ID_LOG_REFRESH, ID_TOGGLE_PROTECTION, ID_SAVE_SETTINGS, ID_FIX,
@@ -105,7 +107,7 @@ enum : int {
     ID_SCHED_OPEN, ID_SCHED_BACK, ID_SCHED_SAVE, ID_SCHED_QUICK, ID_SCHED_FULL, ID_SCHED_DAILY, ID_SCHED_WEEKLY,
     ID_SCHED_HOUR_UP, ID_SCHED_HOUR_DOWN, ID_SCHED_MIN_UP, ID_SCHED_MIN_DOWN, ID_SCHED_DAY_NEXT,
     ID_USB_MODE, ID_THREAT_MODE,
-    ID_THREAT_ISOLATE, ID_THREAT_DELETE, ID_THREAT_IGNORE, ID_THREAT_OPEN, ID_THREAT_ALL,
+    ID_THREAT_ISOLATE, ID_THREAT_DELETE, ID_THREAT_IGNORE, ID_THREAT_OPEN, ID_THREAT_ALL, ID_CLEAN_ANALYZE, ID_CLEAN_RUN,
     ID_FEEDS_OPEN, ID_FEEDS_BACK, ID_FEEDS_SAVE, ID_FEEDS_RUN, ID_FEED_HOURS, ID_FEED_KEY_PASTE, ID_FEED_KEY_REMOVE,
     TOG_AUTOQ = 300, TOG_DECOY, TOG_USB, TOG_NOTIFY, TOG_APPUPD, TOG_SCHED, TOG_DOWNLOADS, TOG_TRAY, TOG_AUTOSTART, TOG_AUTOUPD, TOG_FEEDRULES, TOG_BAZAAR
 };
@@ -117,6 +119,8 @@ constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 4;
 constexpr UINT WM_APP_USB = WM_APP + 7;     // se conectó una unidad (wParam = letra)
 constexpr UINT WM_APP_SHOW = WM_APP + 8;
 constexpr UINT WM_APP_FEEDS_DONE = WM_APP + 9;    // otra instancia pide mostrar la ventana
+constexpr UINT WM_APP_CLEAN_DONE = WM_APP + 10;   // termino el analisis o la limpieza de temporales
+constexpr int TOG_CLEAN_BASE = 700;                  // TOG_CLEAN_BASE + indice de categoria
 enum : int { ID_TRAY_OPEN = 400, ID_TRAY_QUICK, ID_TRAY_TOGGLE, ID_TRAY_EXIT };
 enum : int { ID_DRV_ISOLATE = 5001, ID_DRV_REPAIR, ID_DRV_DETAILS, ID_DRV_CLOSE, ID_DRV_SCAN, ID_DRV_LATER };
 constexpr UINT WM_APP_APPCHECK_DONE = WM_APP + 5;
@@ -167,6 +171,13 @@ struct AppState {
     size_t sigCount{0}, yaraCount{0}, quarantineCount{0};
     std::vector<openguard::ScanResult> threats;
     std::vector<openguard::HistoryEvent> pending;       // amenazas detectadas aun sin resolver (del historial)
+    // Limpieza de temporales
+    struct CleanRow { openguard::cleaner::Category cat; bool selected{true}; bool measured{false}; openguard::cleaner::Usage usage; };
+    std::vector<CleanRow> clean;
+    std::thread cleanThread;
+    std::atomic<bool> cleanBusy{false}, cleanCancel{false};
+    std::wstring cleanMsg;
+    bool cleanMsgOk{true};
     std::vector<openguard::QuarantineItem> quarantined;
     std::wstring scanStatus, updateMsg;
     bool updateOk{true};
@@ -971,6 +982,8 @@ void loadPendingThreats() {
         std::error_code ec;
         if (!fs::is_regular_file(p, ec)) continue; // ya aislado, eliminado o movido
         if (g.prot.isExcluded(p)) continue;
+        int weak = 0; // detecciones antiguas dentro de librerias (node_modules...) ya no se consideran amenazas
+        if (openguard::HeuristicsEngine::weighContentMatch(p, "yara", "high", 70, weak) < 0) continue;
         g.pending.push_back(e);
     }
 }
@@ -1075,11 +1088,14 @@ void layoutControls() {
     if (showProgress) MoveWindow(g.progress, body.left, body.top + S(100) + S(16) + S(30), body.right - body.left, S(8), TRUE);
 }
 
+void startCleanAnalysis(bool force); // definida con el resto del codigo de limpieza
+
 void showPage(Page p) {
     g.page = p;
     refreshData();
     if (p == PG_SCAN) fillThreatList();
     else if (p == PG_THREATS) { loadPendingThreats(); fillPendingList(); }
+    else if (p == PG_CLEANER) startCleanAnalysis(false);
     else if (p == PG_QUARANTINE) fillQuarantineList();
     else if (p == PG_REPORTS) fillReportList();
     else if (p == PG_SETTINGS) { loadSettings(); g.settingsScroll = 0; }
@@ -1366,6 +1382,114 @@ void quarantineAction(bool restore) {
     fillQuarantineList();
     std::wstring msg = std::to_wstring(ok) + L" correctos, " + std::to_wstring(fail) + L" con error.";
     MessageBoxW(g.main, msg.c_str(), L"Cuarentena", MB_OK | (fail ? MB_ICONWARNING : MB_ICONINFORMATION));
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
+// ----------------------------------------------------------------------------- limpieza de temporales
+
+struct CleanReport {
+    bool cleaned{false};
+    std::vector<openguard::cleaner::Usage> usages;
+    openguard::cleaner::CleanResult total;
+};
+
+/// Calcula el espacio recuperable de cada categoria (en un hilo). La primera vez crea la lista de categorias.
+void startCleanAnalysis(bool force) {
+    if (g.cleanBusy) return;
+    if (g.clean.empty()) {
+        for (auto& c : openguard::cleaner::categories()) {
+            AppState::CleanRow row;
+            row.selected = c.defaultSelected;
+            row.cat = std::move(c);
+            g.clean.push_back(std::move(row));
+        }
+    } else if (!force) {
+        return;
+    }
+    if (g.cleanThread.joinable()) g.cleanThread.join();
+    g.cleanBusy = true;
+    g.cleanCancel = false;
+    g.cleanMsg = L"Calculando el espacio recuperable...";
+    g.cleanMsgOk = true;
+    std::vector<openguard::cleaner::Category> cats;
+    for (auto& r : g.clean) { r.measured = false; cats.push_back(r.cat); }
+    g.cleanThread = std::thread([cats]() {
+        auto* rep = new CleanReport();
+        for (const auto& c : cats) rep->usages.push_back(openguard::cleaner::measure(c, &g.cleanCancel));
+        PostMessageW(g.main, WM_APP_CLEAN_DONE, 0, reinterpret_cast<LPARAM>(rep));
+    });
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
+void startClean() {
+    if (g.cleanBusy) return;
+    std::vector<openguard::cleaner::Category> selected, all;
+    uint64_t bytes = 0;
+    bool recycle = false;
+    for (const auto& r : g.clean) {
+        all.push_back(r.cat);
+        if (!r.selected) continue;
+        selected.push_back(r.cat);
+        if (r.measured) bytes += r.usage.bytes;
+        if (r.cat.recycleBin) recycle = true;
+    }
+    if (selected.empty()) {
+        MessageBoxW(g.main, L"Marque al menos una categoria para limpiar.", L"Limpieza", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring ask = L"Se eliminaran los archivos de " + std::to_wstring(selected.size()) + L" categoria(s) (aprox. " +
+                       openguard::cleaner::formatBytes(bytes) + L").";
+    if (recycle) ask += L"\n\nLa Papelera de reciclaje se vaciara y no podra recuperar lo que contiene.";
+    ask += L"\n\nLos archivos en uso se respetan. Continuar?";
+    if (MessageBoxW(g.main, ask.c_str(), L"Limpieza", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+
+    if (g.cleanThread.joinable()) g.cleanThread.join();
+    g.cleanBusy = true;
+    g.cleanCancel = false;
+    g.cleanMsg = L"Limpiando...";
+    g.cleanMsgOk = true;
+    g.cleanThread = std::thread([selected, all]() {
+        auto* rep = new CleanReport();
+        rep->cleaned = true;
+        for (const auto& c : selected) {
+            if (g.cleanCancel) break;
+            const auto r = openguard::cleaner::clean(c, &g.cleanCancel);
+            rep->total.deleted += r.deleted;
+            rep->total.freed += r.freed;
+            rep->total.failed += r.failed;
+        }
+        for (const auto& c : all) rep->usages.push_back(openguard::cleaner::measure(c, &g.cleanCancel));
+        PostMessageW(g.main, WM_APP_CLEAN_DONE, 0, reinterpret_cast<LPARAM>(rep));
+    });
+    InvalidateRect(g.main, nullptr, FALSE);
+}
+
+void onCleanDone(CleanReport* r) {
+    std::unique_ptr<CleanReport> owned(r);
+    if (g.cleanThread.joinable()) g.cleanThread.join();
+    g.cleanBusy = false;
+    for (size_t i = 0; i < g.clean.size() && i < owned->usages.size(); ++i) {
+        g.clean[i].usage = owned->usages[i];
+        g.clean[i].measured = true;
+    }
+    if (owned->cleaned) {
+        std::wstring msg = L"Limpieza completada: " + std::to_wstring(owned->total.deleted) + L" archivos eliminados, " +
+                           openguard::cleaner::formatBytes(owned->total.freed) + L" liberados";
+        if (owned->total.failed) msg += L" (" + std::to_wstring(owned->total.failed) + L" en uso, omitidos)";
+        g.cleanMsg = msg + L".";
+        g.cleanMsgOk = true;
+        pushToast(L"Limpieza: " + openguard::cleaner::formatBytes(owned->total.freed) + L" liberados", C_OK);
+        if (g.history) {
+            openguard::HistoryEvent e;
+            e.level = "INFO";
+            e.kind = "cleanup";
+            e.threat = "Limpieza de temporales";
+            e.action = openguard::paths::toUtf8(fs::path(msg));
+            g.history->record(e);
+        }
+    } else {
+        g.cleanMsg.clear();
+    }
     InvalidateRect(g.main, nullptr, FALSE);
 }
 
@@ -1751,8 +1875,8 @@ void paintSidebar(HDC hdc, int h) {
     text(hdc, L"OPENGUARD", R(S(72), S(22), sw - S(8), S(46)), g.fH2, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     text(hdc, L"A N T I V I R U S", R(S(72), S(46), sw - S(8), S(66)), g.fSmall, C_ACCENT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
-    static const wchar_t* names[PG_COUNT] = {L"Inicio", L"Analisis", L"Amenazas", L"Actualizacion", L"Cuarentena", L"Informes", L"Configuracion"};
-    static const wchar_t* glyphs[PG_COUNT] = {L"\xE80F", L"\xE721", L"\xE7BA", L"\xE895", L"\xE72E", L"\xE8A5", L"\xE713"};
+    static const wchar_t* names[PG_COUNT] = {L"Inicio", L"Analisis", L"Amenazas", L"Limpieza", L"Actualizacion", L"Cuarentena", L"Informes", L"Configuracion"};
+    static const wchar_t* glyphs[PG_COUNT] = {L"\xE80F", L"\xE721", L"\xE7BA", L"\xE74D", L"\xE895", L"\xE72E", L"\xE8A5", L"\xE713"};
     int y = S(104);
     for (int i = 0; i < PG_COUNT; ++i) {
         RECT item = R(S(10), y, sw - S(10), y + S(46));
@@ -2122,6 +2246,45 @@ void paintThreats(HDC hdc, int w, int h) {
     btn(170, L"Seleccionar todo", ID_THREAT_ALL, BS_SECONDARY);
 }
 
+void paintCleaner(HDC hdc, int w, int h) {
+    pageHeader(hdc, w, L"Limpieza", L"Libere espacio eliminando archivos temporales y caches que no necesita");
+    const RECT body = bodyRect(w, h);
+    const int by = bottomButtonsTop(h);
+    const int rowH = S(66);
+    const int n = static_cast<int>(g.clean.size());
+
+    RECT card = R(body.left, body.top, body.right, body.top + rowH * std::max(n, 1) + S(8));
+    drawCard(hdc, card);
+    int y = card.top + S(4);
+    uint64_t selBytes = 0;
+    for (int i = 0; i < n; ++i) {
+        const auto& r = g.clean[static_cast<size_t>(i)];
+        text(hdc, r.cat.name, R(card.left + S(22), y + S(8), card.right - S(340), y + S(30)), g.fBold, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        text(hdc, r.cat.description, R(card.left + S(22), y + S(30), card.right - S(340), y + rowH - S(2)), g.fSmall, C_MUTED);
+        const std::wstring size = r.measured ? openguard::cleaner::formatBytes(r.usage.bytes) + L"  (" + std::to_wstring(r.usage.files) + L" archivos)"
+                                             : std::wstring(L"Calculando...");
+        text(hdc, size, R(card.right - S(330), y + S(8), card.right - S(96), y + S(32)), g.fBold, r.measured ? C_ACCENT : C_MUTED, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
+        drawToggle(hdc, card.right - S(76), y + (rowH - S(24)) / 2, r.selected, TOG_CLEAN_BASE + i);
+        if (r.selected && r.measured) selBytes += r.usage.bytes;
+        y += rowH;
+        fillRect(hdc, R(card.left + S(20), y - 1, card.right - S(20), y), C_BORDER);
+    }
+    if (n == 0) {
+        text(hdc, L"No se encontraron carpetas que limpiar.", R(card.left + S(22), card.top + S(20), card.right - S(22), card.top + S(50)), g.fBody, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    text(hdc, L"Espacio que se liberara: " + openguard::cleaner::formatBytes(selBytes), R(body.left, card.bottom + S(12), body.right, card.bottom + S(38)),
+         g.fH2, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    if (!g.cleanMsg.empty()) {
+        text(hdc, g.cleanMsg, R(body.left, card.bottom + S(42), body.right, card.bottom + S(68)), g.fBody, g.cleanMsgOk ? C_OK : C_BAD, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    text(hdc, L"OpenGuard no toca documentos, descargas ni programas. Solo temporales y caches que Windows y las aplicaciones vuelven a crear.",
+         R(body.left, by - S(34), body.right, by - S(10)), g.fSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+
+    drawButton(hdc, R(body.left, by, body.left + S(230), by + S(40)), g.cleanBusy ? L"Espere..." : L"Limpiar seleccionado", ID_CLEAN_RUN, BS_PRIMARY, !g.cleanBusy && n > 0);
+    drawButton(hdc, R(body.left + S(242), by, body.left + S(242) + S(190), by + S(40)), L"Analizar de nuevo", ID_CLEAN_ANALYZE, BS_SECONDARY, !g.cleanBusy);
+}
+
 void paintQuarantine(HDC hdc, int w, int h) {
     pageHeader(hdc, w, L"Cuarentena", L"Archivos aislados en la boveda cifrada (AES-256)");
     const RECT body = bodyRect(w, h);
@@ -2412,6 +2575,7 @@ void paintAll(HDC hdc, int w, int h) {
         case PG_HOME:       paintHome(hdc, w, h); break;
         case PG_SCAN:       paintScan(hdc, w, h); break;
         case PG_THREATS:    paintThreats(hdc, w, h); break;
+        case PG_CLEANER:    paintCleaner(hdc, w, h); break;
         case PG_UPDATE:     paintUpdate(hdc, w, h); break;
         case PG_QUARANTINE: paintQuarantine(hdc, w, h); break;
         case PG_REPORTS:    paintReports(hdc, w, h); break;
@@ -2435,7 +2599,16 @@ void restartProtectionIfRunning() {
 void onHit(int id) {
     if (id >= NAV_BASE && id < static_cast<int>(NAV_BASE) + static_cast<int>(PG_COUNT)) { showPage(static_cast<Page>(id - NAV_BASE)); return; }
 
+    if (id >= TOG_CLEAN_BASE && id < TOG_CLEAN_BASE + 16) {
+        const size_t i = static_cast<size_t>(id - TOG_CLEAN_BASE);
+        if (i < g.clean.size()) g.clean[i].selected = !g.clean[i].selected;
+        InvalidateRect(g.main, nullptr, FALSE);
+        return;
+    }
+
     switch (id) {
+        case ID_CLEAN_ANALYZE: startCleanAnalysis(true); break;
+        case ID_CLEAN_RUN: startClean(); break;
         case ID_SCAN_QUICK: startScan(quickTargets(), openguard::ScanType::Quick); break;
         case ID_SCAN_FULL:
             if (MessageBoxW(g.main, L"El analisis completo recorre todas las unidades y puede tardar bastante. Continuar?",
@@ -2812,6 +2985,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_APPDL_DONE:
             onAppDownloadDone(reinterpret_cast<DownloadResult*>(lp));
             return 0;
+        case WM_APP_CLEAN_DONE:
+            onCleanDone(reinterpret_cast<CleanReport*>(lp));
+            return 0;
         case WM_APP_FEEDS_DONE:
             onFeedsDone(reinterpret_cast<std::vector<openguard::FeedResult>*>(lp));
             return 0;
@@ -2873,6 +3049,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g.updater.joinable()) g.updater.join();
             if (g.appThread.joinable()) g.appThread.join();
             if (g.feedThread.joinable()) g.feedThread.join();
+            g.cleanCancel = true;
+            if (g.cleanThread.joinable()) g.cleanThread.join();
             PostQuitMessage(0);
             return 0;
         default:

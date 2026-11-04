@@ -352,9 +352,12 @@ std::optional<ScanResult> IsolatedScanner::scan(const std::filesystem::path& fil
 
     // 5. Detecciones del trabajador. Solo se aceptan métodos de contenido: un trabajador comprometido no
     //    puede fabricar una coincidencia de firma (hash_signature) que provoque un aislamiento automático.
+    int weakSeen = 0;
     for (const auto& t : content.threats) {
         if (t.method != "yara" && t.method != "heuristic_script" && t.method != "heuristic_office") continue;
-        result.addThreat(t.name.substr(0, 128), t.method, t.severity.substr(0, 16), t.score, t.details.substr(0, 1024));
+        const int s = HeuristicsEngine::weighContentMatch(filePath, t.method, t.severity, t.score, weakSeen);
+        if (s < 0) continue; // libreria/desarrollo: cadenas tipicas de malware sin contexto
+        result.addThreat(t.name.substr(0, 128), t.method, t.severity.substr(0, 16), s, t.details.substr(0, 1024));
     }
 
     // 6. PE: la firma Authenticode se verifica aquí (necesita servicios del sistema) y se aplica al informe

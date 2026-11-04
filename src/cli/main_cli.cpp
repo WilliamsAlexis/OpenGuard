@@ -27,7 +27,7 @@
 #include <vector>
 
 #ifndef OPENGUARD_VERSION
-#define OPENGUARD_VERSION "0.4.0"
+#define OPENGUARD_VERSION "0.4.1"
 #endif
 
 namespace {

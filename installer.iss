@@ -6,11 +6,11 @@
 ;     powershell -File scripts\build_installer.ps1
 ;
 ; Uso manual (si ya compilo y copio los .exe a dist\stage):
-;     ISCC.exe /DStageDir=dist\stage /DMyAppVersion=0.4.0 installer.iss
+;     ISCC.exe /DStageDir=dist\stage /DMyAppVersion=0.4.1 installer.iss
 ; ==============================================================================
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.4.0"
+  #define MyAppVersion "0.4.1"
 #endif
 #ifndef StageDir
   #define StageDir "dist\stage"

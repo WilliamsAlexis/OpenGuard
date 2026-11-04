@@ -118,11 +118,14 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
             std::vector<uint8_t> head(std::min<size_t>(static_cast<size_t>(fileSize), 4 * 1024 * 1024));
             in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
             head.resize(static_cast<size_t>(in.gcount()));
+            int weakSeen = 0;
             for (const auto& m : m_yara->scan(head.data(), head.size())) {
                 int yScore = 45;
                 if (m.severity == "critical") yScore = 85;
                 else if (m.severity == "high") yScore = 70;
                 else if (m.severity == "low") yScore = 20;
+                yScore = HeuristicsEngine::weighContentMatch(filePath, "yara", m.severity, yScore, weakSeen);
+                if (yScore < 0) continue;
                 result.addThreat("YARA." + m.rule, "yara", m.severity, yScore, m.description);
             }
         }
@@ -150,8 +153,11 @@ ScanResult FileScanner::scanFile(const std::filesystem::path& filePath) {
     // 5. Análisis heurístico profundo de PE y scripts
     if (m_heuristics) {
         ScanResult heurResult = m_heuristics->evaluate(filePath);
+        int weakSeen = 0;
         for (const auto& th : heurResult.threats) {
-            result.addThreat(th.name, th.method, th.severity, th.score, th.details);
+            const int s = HeuristicsEngine::weighContentMatch(filePath, th.method, th.severity, th.score, weakSeen);
+            if (s < 0) continue;
+            result.addThreat(th.name, th.method, th.severity, s, th.details);
         }
     }
 

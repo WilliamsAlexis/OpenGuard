@@ -284,6 +284,27 @@ std::optional<ThreatInfo> HeuristicsEngine::suspiciousLocation(const std::filesy
     return t;
 }
 
+int HeuristicsEngine::weighContentMatch(const std::filesystem::path& file, const std::string& method,
+                                        const std::string& severity, int score, int& weakSeen) {
+    if (severity == "critical") return score;
+    if (method != "yara" && method != "heuristic_script") return score;
+
+    std::wstring w = file.wstring();
+    for (auto& c : w) c = (c == L'/') ? L'\\' : static_cast<wchar_t>(std::towlower(c));
+    static const wchar_t* kLibDirs[] = {L"\\node_modules\\", L"\\site-packages\\", L"\\.git\\", L"\\.nuget\\",
+                                        L"\\.cargo\\", L"\\vcpkg\\", L"\\.vscode\\extensions\\", L"\\bower_components\\"};
+    for (const wchar_t* d : kLibDirs) {
+        if (w.find(d) != std::wstring::npos) return -1;
+    }
+
+    if (method == "yara") {
+        static const std::unordered_set<std::string> kTextExt = {
+            ".js", ".mjs", ".cjs", ".ts", ".map", ".json", ".md", ".txt", ".css", ".html", ".htm", ".xml", ".log", ".py"};
+        if (kTextExt.count(paths::extensionLower(file))) return (weakSeen++ == 0) ? 10 : 0;
+    }
+    return score;
+}
+
 ScanResult HeuristicsEngine::evaluate(const std::filesystem::path& filePath) {
     ScanResult result;
     result.filePath = filePath;
