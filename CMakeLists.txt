@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.22)
 
 # Nombre del proyecto y metadatos de versión
 project(OpenGuard
-    VERSION 0.4.5
+    VERSION 0.4.6
     DESCRIPTION "Antivirus gratuito y de código abierto para Windows en C++20"
     LANGUAGES C CXX
 )

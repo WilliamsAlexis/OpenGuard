@@ -6,11 +6,11 @@
 ;     powershell -File scripts\build_installer.ps1
 ;
 ; Uso manual (si ya compilo y copio los .exe a dist\stage):
-;     ISCC.exe /DStageDir=dist\stage /DMyAppVersion=0.4.5 installer.iss
+;     ISCC.exe /DStageDir=dist\stage /DMyAppVersion=0.4.6 installer.iss
 ; ==============================================================================
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.4.5"
+  #define MyAppVersion "0.4.6"
 #endif
 #ifndef StageDir
   #define StageDir "dist\stage"
@@ -124,7 +124,7 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""O
 ; 2) Registrar e iniciar la proteccion en tiempo real
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "--install"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StatusService}"
 ; 2b) Inicio en segundo plano al iniciar sesion (tarea programada con privilegios elevados: sin pedir permiso cada vez)
-Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""OpenGuard Tray"" /TR ""\""{app}\openguard_gui.exe\"" --tray"" /SC ONLOGON /RL HIGHEST /F"; Flags: runhidden waituntilterminated; Tasks: autostart
+Filename: "{app}\openguard_gui.exe"; Parameters: "--enable-autostart"; Flags: runhidden waituntilterminated; Tasks: autostart
 ; 3) Opcional: lanzar un analisis rapido al terminar
 Filename: "{cmd}"; Parameters: "/k """"{app}\{#MyAppExeName}"" quick"""; WorkingDir: "{app}";  Description: "{cm:RunQuickScan}"; Flags: postinstall nowait skipifsilent unchecked
 

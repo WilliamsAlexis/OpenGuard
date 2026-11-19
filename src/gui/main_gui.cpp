@@ -56,7 +56,7 @@ using std::max;
 #include <uxtheme.h>
 
 #ifndef OPENGUARD_VERSION
-#define OPENGUARD_VERSION "0.4.5"
+#define OPENGUARD_VERSION "0.4.6"
 #endif
 
 #pragma comment(lib, "comctl32.lib")
@@ -334,13 +334,79 @@ bool isAutostartEnabled() {
 
 /// Crea o elimina la tarea programada "OpenGuard Tray" (inicio en segundo plano con privilegios elevados, sin
 /// pedir confirmación en cada inicio de sesión).
+std::wstring xmlEscape(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'&': o += L"&amp;"; break;
+            case L'<': o += L"&lt;"; break;
+            case L'>': o += L"&gt;"; break;
+            case L'"': o += L"&quot;"; break;
+            default: o += c;
+        }
+    }
+    return o;
+}
+
+/// Definicion XML de la tarea de inicio. Con `schtasks /SC ONLOGON` Windows crea la tarea con "iniciar solo si el equipo
+/// esta enchufado": en un portatil con bateria la aplicacion NO arrancaba. Con XML se desactivan esas restricciones.
+bool writeAutostartXml(const fs::path& file) {
+    wchar_t user[256]{}, domain[256]{};
+    if (!GetEnvironmentVariableW(L"USERNAME", user, 256)) return false;
+    GetEnvironmentVariableW(L"USERDOMAIN", domain, 256);
+    const std::wstring id = xmlEscape((domain[0] ? std::wstring(domain) + L"\\" : std::wstring()) + user);
+    const std::wstring exe = xmlEscape((openguard::paths::executableDir() / L"openguard_gui.exe").wstring());
+
+    const std::wstring xml =
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"  <RegistrationInfo><Description>Inicia OpenGuard Antivirus en segundo plano al iniciar sesion</Description></RegistrationInfo>\r\n"
+        L"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + id + L"</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>\r\n"
+        L"  <Principals><Principal id=\"Author\"><UserId>" + id + L"</UserId><LogonType>InteractiveToken</LogonType>"
+        L"<RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n"
+        L"  <Settings>\r\n"
+        L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+        L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+        L"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+        L"    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
+        L"    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+        L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
+        L"    <Enabled>true</Enabled>\r\n"
+        L"    <Hidden>false</Hidden>\r\n"
+        L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+        L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
+        L"    <Priority>6</Priority>\r\n"
+        L"  </Settings>\r\n"
+        L"  <Actions Context=\"Author\"><Exec><Command>" + exe + L"</Command><Arguments>--tray</Arguments></Exec></Actions>\r\n"
+        L"</Task>\r\n";
+
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    const unsigned char bom[2] = {0xFF, 0xFE}; // UTF-16 LE: lo que espera el Programador de tareas
+    out.write(reinterpret_cast<const char*>(bom), 2);
+    out.write(reinterpret_cast<const char*>(xml.data()), static_cast<std::streamsize>(xml.size() * sizeof(wchar_t)));
+    return out.good();
+}
+
 bool setAutostart(bool enable) {
     if (enable) {
-        const std::wstring exe = (openguard::paths::executableDir() / L"openguard_gui.exe").wstring();
-        return runAndWait(systemExe(L"schtasks.exe").wstring(),
-                          L"/Create /TN \"OpenGuard Tray\" /TR \"\\\"" + exe + L"\\\" --tray\" /SC ONLOGON /RL HIGHEST /F");
+        const fs::path xml = openguard::paths::dataDir() / L"autostart_task.xml";
+        if (!writeAutostartXml(xml)) return false;
+        const bool ok = runAndWait(systemExe(L"schtasks.exe").wstring(), L"/Create /TN \"OpenGuard Tray\" /XML \"" + xml.wstring() + L"\" /F");
+        std::error_code ec;
+        fs::remove(xml, ec);
+        if (ok) {
+            iniSetStr(guiIni(), L"gui", L"autostart_task_v", L"2");
+            iniSetStr(guiIni(), L"gui", L"autostart_off", L"0");
+        }
+        return ok;
     }
-    return runAndWait(systemExe(L"schtasks.exe").wstring(), L"/Delete /TN \"OpenGuard Tray\" /F");
+    const bool removed = runAndWait(systemExe(L"schtasks.exe").wstring(), L"/Delete /TN \"OpenGuard Tray\" /F");
+    if (removed) iniSetStr(guiIni(), L"gui", L"autostart_off", L"1"); // decision del usuario: no se vuelve a crear sola
+    return removed;
 }
 
 /// Activa o desactiva la protección en tiempo real (instala el servicio si hace falta).
@@ -3074,6 +3140,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    // Usado por el instalador: crea o quita la tarea de inicio en segundo plano y termina sin abrir ventana
+    if (wcsstr(GetCommandLineW(), L"--enable-autostart")) return setAutostart(true) ? 0 : 1;
+    if (wcsstr(GetCommandLineW(), L"--disable-autostart")) return setAutostart(false) ? 0 : 1;
+
     OleInitialize(nullptr);
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
@@ -3089,6 +3159,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         return 0;
     }
     const bool startHidden = (wcsstr(GetCommandLineW(), L"--tray") != nullptr); // inicio automático: solo el icono
+
+    // Las tareas creadas por versiones anteriores solo arrancaban con el portatil enchufado (o no existian si se uso el
+    // .zip portatil). La primera vez que se abre esta version se crea/repara la tarea de inicio, salvo que el usuario
+    // la haya desactivado a proposito en Configuracion.
+    if (iniGetStr(guiIni(), L"gui", L"autostart_task_v", L"") != L"2" && iniGetStr(guiIni(), L"gui", L"autostart_off", L"0") != L"1") {
+        setAutostart(true);
+    }
 
     g.hInst = hInstance;
     HDC screen = GetDC(nullptr);
