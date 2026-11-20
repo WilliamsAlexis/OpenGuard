@@ -129,8 +129,14 @@ Filename: "{app}\openguard_gui.exe"; Parameters: "--enable-autostart"; Flags: ru
 Filename: "{cmd}"; Parameters: "/k """"{app}\{#MyAppExeName}"" quick"""; WorkingDir: "{app}";  Description: "{cm:RunQuickScan}"; Flags: postinstall nowait skipifsilent unchecked
 
 [UninstallRun]
+; Primero se quita la tarea de inicio y se cierra la app en segundo plano (bandeja): si no, seguia ejecutandose tras desinstalar
+Filename: "{sys}\schtasks.exe"; Parameters: "/End /TN ""OpenGuard Tray"""; Flags: runhidden waituntilterminated; RunOnceId: "EndTrayTask"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""OpenGuard Tray"" /F"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTrayTaskFirst"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM openguard_gui.exe"; Flags: runhidden waituntilterminated; RunOnceId: "KillGui"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM openguard_worker.exe"; Flags: runhidden waituntilterminated; RunOnceId: "KillWorker"
 ; Detiene y remueve el servicio antes de eliminar los archivos
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOpenGuardService"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM {#MyServiceExeName}"; Flags: runhidden waituntilterminated; RunOnceId: "KillService"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""OpenGuard Worker (sin red)"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveWorkerFirewallRule"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""OpenGuard Tray"" /F"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTrayTask"
 
